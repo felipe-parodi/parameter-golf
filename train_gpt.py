@@ -1439,7 +1439,12 @@ def main() -> None:
             module.float()
     restore_low_dim_params_to_fp32(base_model)
     torch._dynamo.config.optimize_ddp = False
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+    _use_compile = bool(int(os.environ.get("USE_COMPILE", "1")))
+    if _use_compile:
+        compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+    else:
+        log0("torch.compile disabled (USE_COMPILE=0)")
+        compiled_model = base_model
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     # Optimizer split:
