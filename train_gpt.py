@@ -1818,13 +1818,17 @@ def main() -> None:
              f"epochs={args.ttt_epochs} freeze_blocks={args.ttt_freeze_blocks} "
              f"causal={args.ttt_causal}")
         t_ttt = time.perf_counter()
+        # Phase 1: standard multi-epoch TTT (broad adaptation)
+        ttt_adapt(args, eval_model, device, val_tokens,
+                  rank=rank, world_size=world_size, log_fn=log0)
+        log0(f"ttt_phase1:elapsed={time.perf_counter() - t_ttt:.1f}s")
+        # Phase 2: causal TTT (per-chunk refinement) — only if TTT_CAUSAL=1
         if args.ttt_causal:
+            t_ttt2 = time.perf_counter()
             ttt_adapt_causal(args, eval_model, device, val_tokens,
                              rank=rank, world_size=world_size, log_fn=log0)
-        else:
-            ttt_adapt(args, eval_model, device, val_tokens,
-                      rank=rank, world_size=world_size, log_fn=log0)
-        log0(f"ttt:elapsed={time.perf_counter() - t_ttt:.1f}s")
+            log0(f"ttt_phase2_causal:elapsed={time.perf_counter() - t_ttt2:.1f}s")
+        log0(f"ttt_total:elapsed={time.perf_counter() - t_ttt:.1f}s")
         if distributed:
             dist.barrier()
 
