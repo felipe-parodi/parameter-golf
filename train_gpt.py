@@ -104,6 +104,7 @@ class Hyperparameters:
     muon_beta2 = float(os.environ.get("MUON_BETA2", 0.95))
     swa_enabled = bool(int(os.environ.get("SWA_ENABLED", "1")))
     swa_every = int(os.environ.get("SWA_EVERY", 200))
+    swa_threshold = float(os.environ.get("SWA_THRESHOLD", 0.5))  # tight SWA: use 0.2
     muon_wd = float(os.environ.get("MUON_WD", 0.02))
     adam_wd = float(os.environ.get("ADAM_WD", 0.01))
     qat_enabled = bool(int(os.environ.get("QAT_ENABLED", "0")))
@@ -1691,7 +1692,7 @@ def main() -> None:
                 for name, t in base_model.state_dict().items():
                     ema_state[name].mul_(d).add_(t.detach().float(), alpha=1.0 - d)
 
-        if args.swa_enabled and not args.ema_enabled and scale < 0.5 and step % args.swa_every == 0:
+        if args.swa_enabled and not args.ema_enabled and scale < args.swa_threshold and step % args.swa_every == 0:
             if swa_state is None:
                 swa_state = {name: t.detach().float().clone() for name, t in base_model.state_dict().items()}
                 swa_count = 1
