@@ -126,6 +126,9 @@ class Hyperparameters:
     ttt_causal = bool(int(os.environ.get("TTT_CAUSAL", "0")))  # causal chunk TTT variant
     ttt_chunk_tokens = int(os.environ.get("TTT_CHUNK_TOKENS", 65536))  # chunk size for causal TTT
 
+    # Memory tokens
+    num_memory_tokens = int(os.environ.get("NUM_MEMORY_TOKENS", 0))
+
     # Gradient-guided adaptive quantization
     grad_quant = bool(int(os.environ.get("GRAD_QUANT", "0")))
     grad_quant_int7_frac = float(os.environ.get("GRAD_QUANT_INT7_FRAC", 0.10))
@@ -793,9 +796,11 @@ class GPT(nn.Module):
         rope_dims: int = 0,
         ln_scale: bool = False,
         zloss_weight: float = 0.0,
+        num_memory_tokens: int = 0,
     ):
         super().__init__()
         self.zloss_weight = zloss_weight
+        self.num_memory_tokens = num_memory_tokens
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
         self.tie_embeddings = tie_embeddings
@@ -804,6 +809,7 @@ class GPT(nn.Module):
         self.mtp_num_heads = mtp_num_heads
         self.mtp_loss_weight = mtp_loss_weight
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
+        self.mem_tokens = nn.Parameter(torch.randn(1, num_memory_tokens, model_dim) * 0.02) if num_memory_tokens > 0 else None
         self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim) if bigram_vocab_size > 0 else None
         self.smear = SmearGate(model_dim)
         self.num_encoder_layers = num_layers // 2
@@ -859,6 +865,12 @@ class GPT(nn.Module):
         if self.bigram is not None:
             x = x + self.bigram(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
+        # Memory tokens: overwrite first K positions with learned embeddings
+        K = self.num_memory_tokens
+        if K > 0 and self.mem_tokens is not None:
+            x = torch.cat([self.mem_tokens.expand(x.size(0), -1, -1).to(dtype=x.dtype), x[:, K:]], dim=1)
+            target_ids = target_ids.clone()
+            target_ids[:, :K] = -100  # mask loss on memory positions
         x = self.smear(x)
         x0 = x
         skips: list[Tensor] = []
@@ -913,6 +925,9 @@ class GPT(nn.Module):
         if self.bigram is not None:
             x = x + self.bigram(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
+        K = self.num_memory_tokens
+        if K > 0 and self.mem_tokens is not None:
+            x = torch.cat([self.mem_tokens.expand(x.size(0), -1, -1).to(dtype=x.dtype), x[:, K:]], dim=1)
         x = self.smear(x)
         x0 = x
         skips: list[Tensor] = []
@@ -1419,6 +1434,7 @@ def main() -> None:
         rope_dims=args.rope_dims,
         ln_scale=args.ln_scale,
         zloss_weight=args.zloss_weight,
+        num_memory_tokens=args.num_memory_tokens,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1452,6 +1468,8 @@ def main() -> None:
         scalar_params.append(base_model.bigram.scale)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     tok_params = [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}]
+    if base_model.mem_tokens is not None:
+        tok_params.append({"params": [base_model.mem_tokens], "lr": token_lr, "base_lr": token_lr})
     if base_model.bigram is not None:
         tok_params.append({"params": [base_model.bigram.embed.weight], "lr": token_lr, "base_lr": token_lr})
         if base_model.bigram.proj is not None:
@@ -1772,6 +1790,7 @@ def main() -> None:
         xsa_last_n=args.xsa_last_n,
         rope_dims=args.rope_dims,
         ln_scale=args.ln_scale,
+        num_memory_tokens=args.num_memory_tokens,
     ).to(device).bfloat16()
     for m in eval_model.modules():
         if isinstance(m, CastedLinear):
