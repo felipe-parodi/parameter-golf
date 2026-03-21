@@ -684,7 +684,9 @@ class CausalSelfAttention(nn.Module):
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
         q = q * self.q_gain.to(dtype=q.dtype)[None, None, :, None]
-        y = flash_attn_3_func(q, k, v, causal=True)
+        # Ensure bf16 for flash attention compatibility
+        fa_dtype = torch.bfloat16
+        y = flash_attn_3_func(q.to(fa_dtype), k.to(fa_dtype), v.to(fa_dtype), causal=True)
         if self.use_xsa:
             y = self._xsa_efficient(y, v)
         y = y.reshape(bsz, seqlen, dim)
