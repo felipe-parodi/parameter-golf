@@ -19,18 +19,38 @@
 - **Steps**: ~mid-training
 - **Results**: Pod killed (low balance). No results.
 
-## Run 3: TTT (FA2) — 6xH100 SXM [IN PROGRESS]
+## Run 3: TTT (FA2) — 6xH100 SXM [ABORTED]
 - **Date**: 2026-03-21
-- **Config**: PR #315 base + TTT_ENABLED=1 (lr=0.002, epochs=3, freeze_blocks=2)
-- **GPUs**: 6xH100 SXM (FA2 fallback)
-- **Steps**: TBD
-- **Results**: TBD
-- **Notes**: 6 GPUs → grad_accum_steps changes. Expect slower but should validate TTT works.
+- **Config**: PR #315 base + TTT + USE_COMPILE=0
+- **GPUs**: 6xH100 SXM (wrong template, Python 3.11, old PyTorch)
+- **Results**: ~440ms/step, too slow. Aborted.
+- **Notes**: Non-template pod, torch.compile broken, flash_attn dtype issues.
 
-## Pending Experiments
-- [ ] Memory tokens (NUM_MEMORY_TOKENS=64) + TTT
-- [ ] Gradient-guided quant (GRAD_QUANT=1) + TTT
-- [ ] Z-loss (ZLOSS_WEIGHT=1e-4) + TTT
-- [ ] Full stack: memory tokens + TTT + grad quant + z-loss
-- [ ] FA3 build + full stack (need 8xH100 SXM)
-- [ ] 3-seed submission runs (SEED=1337,42,2025)
+## Run 4: TTT + FA3 — 8xH100 SXM ⭐
+- **Date**: 2026-03-21
+- **Config**: PR #315 base + TTT_ENABLED=1 (lr=0.002, epochs=3, freeze_blocks=2) + FA3
+- **GPUs**: 8xH100 SXM (FA3, ~82.7ms/step)
+- **Steps**: 7256/9000 (wallclock capped)
+- **Seed**: 1337
+- **Results**:
+  - Pre-quant val_bpb: 1.1417
+  - Post-int6 roundtrip val_bpb: 1.1475
+  - TTT time: 47.8s
+  - **Sliding window (s64) val_bpb: 1.1242** ⭐
+  - Artifact: 15.80 MB (15,801,787 bytes)
+  - Total eval time: ~142s (TTT 48s + roundtrip 2s + sliding 92s)
+- **Notes**: Beats PR #315 (1.1248) by 0.0006. Matches PR #338 territory. FA3 gives 82.7ms/step → 7256 steps vs 5162 on FA2.
+
+## Comparison to SOTA
+| Submission | BPB | Steps | TTT |
+|---|---|---|---|
+| PR #315 (SOTA) | 1.1248 | 7051 | No |
+| PR #338 (TTT) | 1.1254 | 7068 | Yes (same recipe) |
+| **Ours (Run 4)** | **1.1242** | 7256 | Yes |
+
+## Next Steps
+- [ ] Seed 42: same config, verify consistency
+- [ ] Seed 2025: same config, need 3 seeds for p<0.01
+- [ ] Memory tokens (NUM_MEMORY_TOKENS=64) + TTT — potential -0.01 BPB
+- [ ] Gradient-guided quant (GRAD_QUANT=1) — save artifact bytes
+- [ ] Z-loss (ZLOSS_WEIGHT=1e-4) — may reduce quant gap
