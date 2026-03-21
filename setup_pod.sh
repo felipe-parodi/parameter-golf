@@ -18,6 +18,7 @@ fi
 
 # Deps
 pip install -q sentencepiece zstandard huggingface_hub 2>/dev/null || true
+pip install flash-attn --no-build-isolation --no-cache-dir 2>/dev/null || echo "WARNING: flash-attn install failed, will retry"
 
 # Data download
 python3 data/cached_challenge_fineweb.py --variant sp1024
