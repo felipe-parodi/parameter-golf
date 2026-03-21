@@ -48,6 +48,7 @@
 | 8 | Tight SWA | 1.1412 | +0.0071 | 1.1249 | slightly worse |
 | 9 | Causal TTT | 1.1416 | +0.0077 | 1.1262 | faster but worse |
 | 10 | Two-phase TTT | 1.1413 | +0.0080 | 1.1262 | over cap, no gain |
+| 11 | Grad quant | 1.1427 | +0.0055 | 1.1250 | over cap, overhead |
 
 ## Key Learnings
 1. **EMA > Tight SWA** for quant robustness (0.0058 vs 0.0071 gap)
@@ -78,7 +79,21 @@
 - TTT phase 1: 47.8s | Phase 2 (causal): 32.0s | Total: 79.9s
 - **Verdict**: Phase 2 added nothing — same BPB as causal-only (Run 9). Model saturated after standard TTT. Also over 16 MB artifact limit. ❌
 
-## Remaining Ideas
-- [ ] **Grad quant (GRAD_QUANT=1)** — directly targets the quant gap bottleneck
-- [ ] **Higher TTT LR (0.005-0.01)** — current TTT loss barely moves, LR may be too low
-- [ ] **3-seed best config** — submit as non-record with experiment writeup
+## Run 11: Grad Quant + TTT + FA3 — 8xH100 SXM
+- **Config**: Run 4 + GRAD_QUANT=1 (adaptive int5/int6/int7 per tensor)
+- **Steps**: 7139, Seed 1337, ~84.0ms/step (slower due to grad accumulation)
+- **Results**: Sliding **1.1250** | Roundtrip 1.1482 | Pre-quant 1.1427 | Quant gap +0.0055 | **Artifact 16.06 MB ❌ OVER CAP**
+- **Quant distribution**: {int5: 13, int6: 47, int7: 6, int8: 2}
+- **Verdict**: Quant gap improved (0.0055 vs 0.0058) but overhead cost ~117 steps AND artifact over 16 MB. Net worse. ❌
+
+## Summary After 11 Runs
+- **Best**: Run 4 (EMA + TTT) at **1.1242 BPB**
+- **Nothing has beaten Run 4** — 7 variations tried, all equal or worse
+- **Quant gap reduced** by grad quant (0.0055 vs 0.0058) but offset by overhead
+- **Ceiling**: ~1.124 with current 11L/512d meta
+
+## Key Insight
+The remaining BPB gains likely come from **eval-time techniques** (not training):
+- PPM-C classical probability mixing (PR #283): -0.003 to -0.008 BPB, zero artifact
+- Neural Cache cross-window KV (PR #318): extend context to full documents
+- These compose with TTT and cost zero training budget
