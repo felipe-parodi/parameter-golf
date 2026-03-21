@@ -61,10 +61,14 @@
 - ❌ Tight SWA — worse quant gap than EMA
 - ❌ Depth recurrence — 900x quant error amplification (PR #363)
 
+## Run 9: Causal TTT (NOVEL) + EMA + FA3 — 8xH100 SXM [IN PROGRESS]
+- **Config**: Run 4 base + TTT_CAUSAL=1, TTT_CHUNK_TOKENS=16384, TTT_LR=0.003
+- **Steps**: TBD, Seed 1337
+- **What's novel**: Single-pass online TTT. Score each chunk BEFORE updating. Later chunks benefit from earlier adaptation. ~3800 gradient steps (vs standard TTT's ~2800). Higher LR (0.003 vs 0.002) to compensate for single pass.
+- **Hypothesis**: More principled adaptation = better or equal BPB, with honest scoring (no data leakage across epochs).
+- **Results**: TBD
+
 ## Remaining Ideas
 - [ ] **Grad quant (GRAD_QUANT=1)** — directly targets the quant gap bottleneck
 - [ ] **Z-loss (ZLOSS_WEIGHT=1e-4)** — regularize logits, may help quant
-- [ ] **Aggressive TTT (LR=0.005, epochs=5)** — push TTT harder
-- [ ] **Causal TTT** — our novel variant
-- [ ] **No Late QAT** — test if it's actually helping or hurting
-- [ ] **3-seed Run 4 config** — submit as non-record with TTT writeup
+- [ ] **3-seed best config** — submit as non-record with experiment writeup
