@@ -46,6 +46,8 @@
 | 6 | WD=20000 | 1.1503 | +0.1399 | ~1.28 | ❌ |
 | 7 | Batch 524K | — | — | killed | ❌ |
 | 8 | Tight SWA | 1.1412 | +0.0071 | 1.1249 | slightly worse |
+| 9 | Causal TTT | 1.1416 | +0.0077 | 1.1262 | faster but worse |
+| 10 | Two-phase TTT | 1.1413 | +0.0080 | 1.1262 | over cap, no gain |
 
 ## Key Learnings
 1. **EMA > Tight SWA** for quant robustness (0.0058 vs 0.0071 gap)
@@ -55,10 +57,11 @@
 5. **We're at a ceiling of ~1.124** with the current meta + TTT
 
 ## Confirmed Dead Ends
-- ❌ Memory tokens — don't survive quant
-- ❌ Warmdown=20000 — destroys quant (24x worse gap)
-- ❌ Batch 524K — fewer tokens/step not compensated
-- ❌ Tight SWA — worse quant gap than EMA
+- ❌ Memory tokens — don't survive quant (Run 5)
+- ❌ Warmdown=20000 — destroys quant, 24x worse gap (Run 6)
+- ❌ Batch 524K — fewer tokens/step not compensated (Run 7)
+- ❌ Tight SWA — worse quant gap than EMA (Run 8)
+- ❌ Two-phase TTT — phase 2 adds nothing after standard TTT (Run 10)
 - ❌ Depth recurrence — 900x quant error amplification (PR #363)
 
 ## Run 9: Causal TTT (NOVEL) + EMA + FA3 — 8xH100 SXM
@@ -68,12 +71,12 @@
 - **What's novel**: Single-pass online TTT. Score each chunk BEFORE updating.
 - **Verdict**: Slightly worse than standard TTT (1.1262 vs 1.1242) but 33% faster (32s vs 48s). The gap is mostly training variance, not TTT quality. ≈same
 
-## Run 10: Two-Phase TTT (NOVEL) + EMA + FA3 — 8xH100 SXM [IN PROGRESS]
-- **Config**: Run 4 base + TTT_CAUSAL=1 (now triggers both phases), TTT_CHUNK_TOKENS=16384, TTT_LR=0.003
-- **Steps**: TBD, Seed 1337
-- **What's novel**: Phase 1 = standard 3-epoch TTT (~48s, broad adaptation). Phase 2 = causal chunk TTT (~32s, per-chunk refinement). Total ~80s, well under 600s eval budget. Nobody has stacked two TTT approaches.
-- **Hypothesis**: Broad adaptation + fine-grained refinement > either alone.
-- **Results**: TBD
+## Run 10: Two-Phase TTT (NOVEL) + EMA + FA3 — 8xH100 SXM ❌
+- **Config**: Run 4 base + TTT_CAUSAL=1 (both phases), TTT_CHUNK_TOKENS=16384, TTT_LR=0.003
+- **Steps**: 7247, Seed 1337, ~82.8ms/step
+- **Results**: Sliding **1.1262** | Roundtrip 1.1493 | Pre-quant 1.1413 | Quant gap +0.0080 | **Artifact 16.15 MB ❌ OVER CAP**
+- TTT phase 1: 47.8s | Phase 2 (causal): 32.0s | Total: 79.9s
+- **Verdict**: Phase 2 added nothing — same BPB as causal-only (Run 9). Model saturated after standard TTT. Also over 16 MB artifact limit. ❌
 
 ## Remaining Ideas
 - [ ] **Grad quant (GRAD_QUANT=1)** — directly targets the quant gap bottleneck
