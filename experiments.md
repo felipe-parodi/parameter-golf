@@ -61,14 +61,21 @@
 - ❌ Tight SWA — worse quant gap than EMA
 - ❌ Depth recurrence — 900x quant error amplification (PR #363)
 
-## Run 9: Causal TTT (NOVEL) + EMA + FA3 — 8xH100 SXM [IN PROGRESS]
+## Run 9: Causal TTT (NOVEL) + EMA + FA3 — 8xH100 SXM
 - **Config**: Run 4 base + TTT_CAUSAL=1, TTT_CHUNK_TOKENS=16384, TTT_LR=0.003
+- **Steps**: 7242, Seed 1337, ~82.9ms/step
+- **Results**: Sliding **1.1262** | Roundtrip 1.1493 | Pre-quant 1.1416 | Quant gap +0.0077 | Artifact 15.56 MB | TTT 32.2s
+- **What's novel**: Single-pass online TTT. Score each chunk BEFORE updating.
+- **Verdict**: Slightly worse than standard TTT (1.1262 vs 1.1242) but 33% faster (32s vs 48s). The gap is mostly training variance, not TTT quality. ≈same
+
+## Run 10: Two-Phase TTT (NOVEL) + EMA + FA3 — 8xH100 SXM [IN PROGRESS]
+- **Config**: Run 4 base + TTT_CAUSAL=1 (now triggers both phases), TTT_CHUNK_TOKENS=16384, TTT_LR=0.003
 - **Steps**: TBD, Seed 1337
-- **What's novel**: Single-pass online TTT. Score each chunk BEFORE updating. Later chunks benefit from earlier adaptation. ~3800 gradient steps (vs standard TTT's ~2800). Higher LR (0.003 vs 0.002) to compensate for single pass.
-- **Hypothesis**: More principled adaptation = better or equal BPB, with honest scoring (no data leakage across epochs).
+- **What's novel**: Phase 1 = standard 3-epoch TTT (~48s, broad adaptation). Phase 2 = causal chunk TTT (~32s, per-chunk refinement). Total ~80s, well under 600s eval budget. Nobody has stacked two TTT approaches.
+- **Hypothesis**: Broad adaptation + fine-grained refinement > either alone.
 - **Results**: TBD
 
 ## Remaining Ideas
 - [ ] **Grad quant (GRAD_QUANT=1)** — directly targets the quant gap bottleneck
-- [ ] **Z-loss (ZLOSS_WEIGHT=1e-4)** — regularize logits, may help quant
+- [ ] **Higher TTT LR (0.005-0.01)** — current TTT loss barely moves, LR may be too low
 - [ ] **3-seed best config** — submit as non-record with experiment writeup
