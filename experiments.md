@@ -4,7 +4,7 @@
 | Run | Config | Pre-quant | Quant gap | Sliding BPB | Artifact | Verdict |
 |-----|--------|-----------|-----------|-------------|----------|---------|
 | 1 | Baseline FA2 | 1.1534 | +0.0066 | 1.1366 | 15.55 MB | FA2 penalty |
-| 4 ⭐ | EMA + TTT(3ep,lr=0.002) + FA3 | 1.1417 | +0.0058 | **1.1242** | 15.80 MB | Best so far |
+| 4 | EMA + TTT(3ep,0.002,frz=2) + FA3 | 1.1417 | +0.0058 | 1.1242 | 15.80 MB | prev best |
 | 5 | + Memory tokens | 1.1421 | +0.0055 | 1.1244 | 15.82 MB | ≈same |
 | 6 | + WD=20000 | 1.1503 | +0.1399 | ~1.28 | 12.93 MB | ❌ catastrophic |
 | 7 | + Batch 524K | — | — | killed | — | ❌ way behind |
@@ -13,82 +13,119 @@
 | 10 | Two-phase TTT | 1.1413 | +0.0080 | 1.1262 | 16.15 MB ❌ | over cap |
 | 11 | + Grad quant | 1.1427 | +0.0055 | 1.1250 | 16.06 MB ❌ | over cap |
 | 12 | Z-loss + no Late QAT | 1.1443 | +0.0063 | 1.1274 | 15.98 MB | worse |
-| 12 | Z-loss + no Late QAT | 1.1443 | +0.0063 | 1.1274 | 15.98 MB | worse |
 | 14 | TTT(20ep,0.008,frz=2)+PPM | 1.1413 | +0.0301 | 1.1488 | — | ❌ catastrophic |
-| 15 ⭐ | TTT(20ep,0.008,**frz=0**)+noQAT+noXSA | 1.1418 | +0.0028 | **1.1213** | 15.53 MB | **NEW BEST** |
-| 12 | + Z-loss + no Late QAT | 1.1443 | +0.0063 | 1.1274 | 15.98 MB | ❌ worse |
-| 13 | PPM + TTT (crashed x2) | 1.1415 | +0.0056 | 1.1237 | 15.91 MB | PPM NCCL timeout |
+| 15 ⭐ | TTT(20ep,0.008,**frz=0**)+noQAT+noXSA | 1.1418 | +0.0028 | **1.1213** | 15.53 MB | **SUBMITTED** |
 
-## Current Competition Landscape (2026-03-22)
+## Final 3-Seed Results (Run 15 config — PR #398)
+| Seed | Steps | Step avg | Pre-quant | Roundtrip | Sliding BPB | Artifact |
+|------|-------|----------|-----------|-----------|-------------|----------|
+| 1337 | 7386 | 81.2ms | 1.1418 | 1.1446 | **1.1213** | 15.53 MB |
+| 42 | 7411 | 81.0ms | 1.1426 | 1.1454 | 1.1221 | 15.51 MB |
+| 2025 | 7386 | 81.2ms | 1.1418 | 1.1461 | 1.1228 | 15.53 MB |
+| **Mean** | | | | | **1.1221** | |
+| **Std** | | | | | **0.0008** | |
 
-| PR | BPB | Author | Key Innovation |
-|---|---|---|---|
-| **#388** | **1.1231** | ElliotSlusky | Tight SWA + VE128 + **TTT(25ep,lr=0.008)** |
-| #374 | 1.1246 | unnir | Tight SWA + VE128 (no TTT) |
-| #379 | 1.1260 | dannywillowliu | GPTQ-lite + Self-Distillation TTT |
-| #315 | 1.1248 | jfprincz | Partial RoPE + LN Scale + EMA + XSA4 |
-| **Ours** | **1.1237-1.1242** | — | EMA + TTT(3ep,lr=0.002) + FA3 |
-| #383 | 1.1320 | joelnishanth | Tight SWA + Late QAT |
+## Winning Config
+```bash
+SEED=1337 NUM_LAYERS=11 BIGRAM_VOCAB_SIZE=2048 XSA_LAST_N=0 \
+EMA_ENABLED=1 EMA_DECAY=0.997 SWA_ENABLED=0 \
+ROPE_DIMS=16 LN_SCALE=1 LATE_QAT=0 \
+TTT_ENABLED=1 TTT_LR=0.008 TTT_EPOCHS=20 TTT_MOMENTUM=0.9 TTT_FREEZE_BLOCKS=0 \
+MUON_WD=0.04 ADAM_WD=0.04 \
+MATRIX_LR=0.025 SCALAR_LR=0.025 TIED_EMBED_LR=0.035 \
+MUON_MOMENTUM=0.99 MUON_MOMENTUM_WARMUP_START=0.92 \
+MUON_MOMENTUM_WARMUP_STEPS=1500 WARMDOWN_ITERS=3000 \
+ITERATIONS=9000 MAX_WALLCLOCK_SECONDS=600 EVAL_STRIDE=64 \
+torchrun --standalone --nproc_per_node=8 train_gpt.py
+```
 
-**Key finding: PR #388 uses 25-epoch TTT at lr=0.008 — we use 3 epochs at lr=0.002. We're massively under-tuning TTT.**
+## Key Findings (ranked by importance)
 
-## Confirmed Dead Ends (our runs + PR #375's $500 study)
-- ❌ Memory tokens — don't survive quant (Run 5, PR #375)
-- ❌ Aggressive warmdown=20000 — destroys quant (Run 6)
-- ❌ Batch 524K — fewer tokens/step not compensated (Run 7, PR #375)
-- ❌ Tight SWA — worse quant gap than EMA (Run 8); though PR #388 uses it
-- ❌ Two-phase TTT — phase 2 adds nothing (Run 10)
-- ❌ Grad quant — overhead + over artifact cap (Run 11, PR #375)
-- ❌ Z-loss — hurts pre-quant quality (Run 12)
-- ❌ Causal TTT — marginally worse than standard TTT (Run 9, PR #375)
-- ❌ Depth recurrence — 900x quant error amplification (PR #363, #386)
-- ❌ Late QAT — may be dead code under torch.compile (PR #315 note)
-- ❌ Tokenizer changes — longer tokens harder to predict (PR #384)
-- ❌ Multi-token prediction — throughput penalty kills it (PR #375)
-- ❌ Self-distillation TTT — slightly negative (PR #379)
+### 1. FREEZE_BLOCKS=0 is the single biggest lever
+With aggressive TTT (20ep, lr=0.008), freezing early blocks is catastrophic:
+- freeze=2: quant gap +0.030, sliding 1.1488 ❌
+- freeze=0: quant gap +0.003, sliding 1.1213 ✅
+All layers must adapt coherently during TTT. Partial freezing creates internal inconsistency.
 
-## What Actually Works (competition-validated)
-- ✅ EMA (0.997) — better than SWA by 0.003 (PR #375 3-seed)
-- ✅ TTT with aggressive hyperparams — 25 epochs, lr=0.008 (PR #388)
-- ✅ FA3 Hopper — 15-20% more steps (PR #375)
-- ✅ 786K batch > 524K (PR #375)
-- ✅ Eval-time caching/mixing — -0.003 to -0.005 BPB (PR #384, #387)
-- ✅ Int5 uniform + 10% pruning — saves ~1.5MB (PR #389)
-- ✅ XSA on last 4-5 layers
-- ✅ Partial RoPE (16/64 dims)
-- ✅ 1ms overhead = 0.006 BPB cost (PR #375 meta-insight)
+### 2. Late QAT must be disabled with aggressive TTT
+PR #388 noted this too. QAT makes weights unfriendly for subsequent TTT adaptation.
 
-## Run 14: Aggressive TTT(20ep,lr=0.008,freeze=2) + PPM — 8xH100 SXM ❌
-- **Config**: Run 4 + TTT_EPOCHS=20 TTT_LR=0.008 TTT_FREEZE_BLOCKS=2 + PPM_ALPHA=0.95
-- **Steps**: 7262, Seed 1337
-- **Results**:
-  - Sliding (no PPM): **1.1488** ❌ (Run 4 was 1.1242)
-  - Sliding + PPM: **1.1639** ❌❌ (PPM made it WORSE)
-  - Roundtrip: 1.1714 | Quant gap: +0.030 (Run 4 was +0.006)
-- **Verdict**: Catastrophic. Aggressive TTT with 2 frozen blocks destroys the model. PPM blending on a degraded model pulls toward weaker predictions. ❌
-- **Root cause**: PR #388 uses FREEZE_BLOCKS=0. Freezing 2 blocks creates internal inconsistency — unfrozen layers overfit while frozen layers can't adapt.
+### 3. XSA removal saves steps → better BPB
+Without XSA: ~81ms/step (7386 steps). With XSA: ~83ms/step (7256 steps).
+130 extra steps × better convergence > XSA quality benefit.
 
-## Run 15: TTT(20ep,0.008,freeze=0) + noQAT + noXSA + PPM — 8xH100 SXM ⭐ NEW BEST
-- **Config**: EMA + TTT_EPOCHS=20 TTT_LR=0.008 TTT_FREEZE_BLOCKS=0 LATE_QAT=0 XSA_LAST_N=0 + PPM
-- **Steps**: 7386, Seed 1337, ~81.2ms/step (faster: no XSA overhead)
-- **Results**:
-  - Pre-quant: 1.1418 | Quant gap: **+0.0028** (half of Run 4!)
-  - Roundtrip: 1.1446
-  - TTT loss: 1.9406 → 1.9335 (-0.007, much better than freeze=2)
-  - **Sliding window: 1.1213** ⭐ (beats PR #388's 1.1231)
-  - PPM sliding: 1.1350 ❌ (PPM hurts strong models)
-  - Artifact: 15.53 MB ✓
-  - TTT time: 292s | Total eval: ~375s
-- **Key findings**:
-  - FREEZE_BLOCKS=0 is critical — lets all layers adapt coherently
-  - No Late QAT keeps weights clean for TTT
-  - No XSA saves ~1.4ms/step → more training steps
-  - PPM confirmed dead on strong baselines (adds noise)
+### 4. EMA beats Tight SWA for quant robustness
+EMA quant gap: +0.006. Tight SWA quant gap: +0.007. Consistent across runs.
 
-## Confirmed Dead: PPM-C
-PPM hurts on strong baselines (1.1350 vs 1.1213 without it). The neural model already captures bigram patterns — blending 5% weak signal just adds noise. Would need alpha=0.999+ to not hurt, at which point gain is negligible.
+### 5. Aggressive TTT (20ep) >> Conservative TTT (3ep)
+TTT loss drop: 0.007 (20ep) vs 0.002 (3ep). The model keeps learning through epoch 20.
+But only works with freeze=0.
 
-## Next Steps
-- [ ] **SEED=42**: verify Run 15 config consistency
-- [ ] **SEED=2025**: third seed for p<0.01
-- [ ] If consistent: prepare submission PR
+### 6. PPM-C eval-time blending hurts strong models
+On weak baseline (smoke, 200 steps): -0.11 BPB improvement.
+On strong baseline (1.12): +0.014 BPB WORSE. The neural model already captures bigram patterns.
+
+### 7. Memory tokens, grad quant, z-loss — all dead ends on strong baselines
+Confirmed by both our experiments and PR #375's $500 systematic study.
+
+### 8. 1ms/step overhead = 0.006 BPB cost
+This heuristic from PR #375 held true in all our runs. Any technique that adds per-step overhead must justify itself against this cost.
+
+## Confirmed Dead Ends
+| Technique | Run(s) | Why it failed |
+|-----------|--------|---------------|
+| Memory tokens | 5 | Don't survive int6 quantization |
+| Warmdown=20000 | 6 | Over-smooths weights, 24x worse quant gap |
+| Batch 524K | 7 | Fewer tokens/step not compensated by more steps |
+| Tight SWA | 8 | Worse quant gap than EMA |
+| Two-phase TTT | 10 | Phase 2 adds nothing after standard TTT |
+| Grad-guided quant | 11 | Overhead + artifact over 16 MB |
+| Z-loss | 12 | Hurts pre-quant quality |
+| TTT with freeze=2 at high LR | 14 | Internal inconsistency, catastrophic quant gap |
+| PPM-C eval blending | 14,15 | Hurts strong models, adds noise |
+| Depth recurrence | PR #363 | 900x quant error amplification |
+| Late QAT | PR #360 | Net negative under 10-min budget |
+| Tokenizer changes | PR #384 | Longer tokens harder to predict |
+| Multi-token prediction | PR #375 | Throughput penalty kills it |
+| Self-distillation TTT | PR #379 | Slightly negative |
+| Causal TTT | 9, PR #375 | Neutral or worse on strong baselines |
+
+## Operational Lessons
+
+### Pod Setup
+- **ALWAYS use the Parameter Golf template** (`runpod/parameter-golf:latest`). Non-template pods have wrong PyTorch → torch.compile breaks, flash_attn dtype errors. Wasted 1 full run cycle learning this.
+- **FA3 via pre-built wheel** (instant): `pip install flash_attn_3 --find-links https://windreamer.github.io/flash-attention3-wheels/cu128_torch291`. Building from source wastes 10+ min.
+- **Install numba** for CPU-bound eval loops (50-100x speedup). PPM went from 338s → 1.5s.
+- **Use tmux** — terminal disconnects kill running jobs.
+- **Smoke test first** (ITERATIONS=200, MAX_WALLCLOCK_SECONDS=60) — we wasted 3 full runs on features that crashed during eval.
+- **Use setup_pod.sh** for reproducible setup in one command.
+
+### Budget
+- 8xH100 SXM on-demand: ~$21.50/hr
+- Each full run (train + eval): ~15 min = ~$5.40
+- Data download + FA3 install + setup: ~5 min
+- Session 1 total: ~$33 for 15 runs (including wasted runs on wrong pods)
+- **Remaining: ~$67**
+
+### Workflow
+- **Check new PRs FIRST** before running anything. We could have matched PR #388's config from the start if we'd seen their FREEZE_BLOCKS=0 finding.
+- **Log everything** — exact commands, timestamps, results. This notebook saved us from repeating failed experiments.
+- **`runpodctl send/receive`** for file transfer between pod and local machine.
+- **landscape.md** tracks the full competitive field — update at start of each session.
+
+## Ideas for Next Session
+- [ ] Check PR #398 review status and feedback
+- [ ] Scan for new SOTA (competition moves fast — 20+ PRs/day)
+- [ ] Try TTT_EPOCHS=25 (match PR #388, we have eval budget headroom)
+- [ ] Implement Shared Value Embeddings (VE128) from PR #374/388
+- [ ] Try 12L architecture (NUM_LAYERS=12 MLP_HIDDEN=1408) — more capacity
+- [ ] Try cuDNN SDPA instead of FA3 (PR #388 claims 1.18x faster for GQA)
+- [ ] GPTQ-lite clip percentile search (PR #379) — zero-cost quant refinement
+- [ ] Int5 uniform + 10% pruning (PR #389) — save artifact bytes
+- [ ] Consider combining TTT with eval-time bigram cache at very low alpha (0.01-0.05)
+
+## Timeline
+- Session 1: 2026-03-21/22 (this session)
+- PR #398 submitted: https://github.com/openai/parameter-golf/pull/398
+- Competition ends: 2026-04-30 (~5.5 weeks remaining)
+- Budget: ~$67 (~12 full runs on 8xH100 SXM)
