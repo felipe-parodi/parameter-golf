@@ -138,6 +138,11 @@ class Hyperparameters:
     # Z-loss regularization
     zloss_weight = float(os.environ.get("ZLOSS_WEIGHT", 0.0))
 
+    # PPM-C eval-time probability mixing
+    ppm_enabled = bool(int(os.environ.get("PPM_ENABLED", "0")))
+    ppm_alpha = float(os.environ.get("PPM_ALPHA", 0.95))
+    ppm_max_order = int(os.environ.get("PPM_MAX_ORDER", 3))
+
 # -----------------------------
 # MUON OPTIMIZER
 # -----------------------------
@@ -1186,6 +1191,193 @@ def ttt_adapt_causal(args: Hyperparameters, base_model: nn.Module, device: torch
 
 
 # -----------------------------
+# PPM-C EVAL-TIME PROBABILITY MIXING
+# -----------------------------
+#
+# Classical Prediction by Partial Matching blended with neural model predictions.
+# The PPM captures byte/token-level patterns (repetitions, formatting) that the
+# neural model misses. Zero artifact cost — statistics built at eval time.
+
+from collections import defaultdict
+
+class PPMModel:
+    """Prediction by Partial Matching (Method C) — classical compression model."""
+
+    def __init__(self, max_order: int = 3, vocab_size: int = 1024):
+        self.max_order = max_order
+        self.vocab_size = vocab_size
+        self.counts: list[dict] = [defaultdict(lambda: defaultdict(int)) for _ in range(max_order + 1)]
+        self.totals: list[dict] = [defaultdict(int) for _ in range(max_order + 1)]
+        self.uniques: list[dict] = [defaultdict(int) for _ in range(max_order + 1)]
+
+    def predict_and_update(self, context: tuple[int, ...], symbol: int) -> float:
+        """Predict P(symbol | context) using Method C escape, then update counts."""
+        prob = 0.0
+        escape = 1.0
+        for k in range(min(len(context), self.max_order), -1, -1):
+            ctx = context[-k:] if k > 0 else ()
+            total = self.totals[k].get(ctx, 0)
+            unique = self.uniques[k].get(ctx, 0)
+            if total == 0:
+                continue
+            denom = total + unique
+            sym_count = self.counts[k][ctx].get(symbol, 0)
+            if sym_count > 0:
+                prob += escape * (sym_count / denom)
+            escape *= unique / denom
+        prob += escape * (1.0 / self.vocab_size)
+        # Update
+        for k in range(min(len(context), self.max_order), -1, -1):
+            ctx = context[-k:] if k > 0 else ()
+            if symbol not in self.counts[k][ctx]:
+                self.uniques[k][ctx] += 1
+            self.counts[k][ctx][symbol] += 1
+            self.totals[k][ctx] += 1
+        return prob
+
+
+def eval_val_sliding_with_ppm(
+    args: Hyperparameters,
+    base_model: nn.Module,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+    val_tokens: Tensor,
+    base_bytes_lut: Tensor,
+    has_leading_space_lut: Tensor,
+    is_boundary_token_lut: Tensor,
+    stride: int,
+    alpha: float = 0.95,
+    ppm_max_order: int = 3,
+    batch_seqs: int = 32,
+    eval_seq_len: int | None = None,
+    log_fn=None,
+) -> tuple[float, float]:
+    """Sliding window eval with PPM-C probability blending.
+
+    Phase 1 (GPU): standard sliding window, stores per-token NLLs.
+    Phase 2 (CPU): PPM pass over val tokens, blends with neural NLLs, computes BPB.
+    """
+    seq_len = eval_seq_len or args.train_seq_len
+    total_tokens = val_tokens.numel() - 1
+
+    # Phase 1: Neural sliding window — store per-token NLLs
+    window_starts = [ws for ws in range(0, total_tokens, stride)
+                     if min(ws + seq_len, total_tokens) - ws >= 1]
+    total_windows = len(window_starts)
+    my_s = (total_windows * rank) // world_size
+    my_e = (total_windows * (rank + 1)) // world_size
+    my_windows = window_starts[my_s:my_e]
+
+    # Per-token NLL storage (only for this rank's scored tokens)
+    local_nlls: dict[int, float] = {}
+
+    base_model.eval()
+    compiled_logits = torch.compile(base_model.forward_logits, dynamic=False, fullgraph=True)
+
+    with torch.inference_mode():
+        for bi in range(0, len(my_windows), batch_seqs):
+            batch_ws = my_windows[bi:bi + batch_seqs]
+            bsz = len(batch_ws)
+            x_batch = torch.zeros(bsz, seq_len, dtype=torch.int64, device=device)
+            y_batch = torch.zeros(bsz, seq_len, dtype=torch.int64, device=device)
+            wlens: list[int] = []
+            for i, ws in enumerate(batch_ws):
+                end = min(ws + seq_len, total_tokens)
+                wlen = end - ws
+                wlens.append(wlen)
+                chunk = val_tokens[ws:end + 1].to(dtype=torch.int64, device=device)
+                x_batch[i, :wlen] = chunk[:-1]
+                y_batch[i, :wlen] = chunk[1:]
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                logits = compiled_logits(x_batch)
+            nll = F.cross_entropy(
+                logits.reshape(-1, logits.size(-1)).float(),
+                y_batch.reshape(-1), reduction="none",
+            ).reshape(bsz, seq_len)
+            for i, ws in enumerate(batch_ws):
+                wlen = wlens[i]
+                s = 0 if ws == 0 else max(wlen - stride, 0)
+                for j in range(s, wlen):
+                    global_target_pos = ws + j + 1
+                    local_nlls[global_target_pos] = float(nll[i, j].item())
+
+    # Gather all NLLs to rank 0 for PPM blending
+    if dist.is_available() and dist.is_initialized():
+        import pickle
+        if rank == 0:
+            all_nlls = dict(local_nlls)
+            for src in range(1, world_size):
+                buf_size = torch.zeros(1, dtype=torch.long, device=device)
+                dist.recv(buf_size, src=src)
+                buf = torch.zeros(int(buf_size.item()), dtype=torch.uint8, device="cpu")
+                dist.recv(buf, src=src)
+                remote_nlls = pickle.loads(buf.numpy().tobytes())
+                all_nlls.update(remote_nlls)
+        else:
+            data = pickle.dumps(local_nlls)
+            buf_size = torch.tensor([len(data)], dtype=torch.long, device=device)
+            dist.send(buf_size, dst=0)
+            buf = torch.frombuffer(bytearray(data), dtype=torch.uint8).to("cpu")
+            dist.send(buf, dst=0)
+            all_nlls = {}
+        dist.barrier()
+    else:
+        all_nlls = local_nlls
+
+    # Phase 2: PPM blend (rank 0 only, CPU)
+    if rank == 0:
+        tokens_np = val_tokens.numpy().astype(int)
+        base_bytes_cpu = base_bytes_lut.cpu()
+        has_leading_space_cpu = has_leading_space_lut.cpu()
+        is_boundary_cpu = is_boundary_token_lut.cpu()
+
+        ppm = PPMModel(max_order=ppm_max_order, vocab_size=args.vocab_size)
+        blend_nll_sum = 0.0
+        blend_byte_sum = 0.0
+        scored_count = 0
+
+        for t in range(1, total_tokens + 1):
+            target = int(tokens_np[t])
+            context = tuple(tokens_np[max(0, t - ppm_max_order):t])
+            p_ppm = ppm.predict_and_update(context, target)
+
+            if t in all_nlls:
+                nll_neural = all_nlls[t]
+                p_neural = math.exp(-nll_neural) if nll_neural < 50 else 0.0
+                p_mix = alpha * p_neural + (1.0 - alpha) * p_ppm
+                nll_mix = -math.log(max(p_mix, 1e-30))
+                blend_nll_sum += nll_mix
+
+                prev = int(tokens_np[t - 1])
+                byte_count = float(base_bytes_cpu[target].item())
+                if bool(has_leading_space_cpu[target].item()) and not bool(is_boundary_cpu[prev].item()):
+                    byte_count += 1.0
+                blend_byte_sum += byte_count
+                scored_count += 1
+
+            if log_fn and t % 10_000_000 == 0:
+                log_fn(f"ppm:progress {t}/{total_tokens} scored:{scored_count}")
+
+        bpb = (blend_nll_sum / math.log(2.0)) / blend_byte_sum if blend_byte_sum > 0 else 0.0
+        val_loss = blend_nll_sum / scored_count if scored_count > 0 else 0.0
+        if log_fn:
+            log_fn(f"ppm:done scored:{scored_count} val_loss:{val_loss:.4f} val_bpb:{bpb:.4f}")
+    else:
+        bpb = 0.0
+        val_loss = 0.0
+
+    # Broadcast result to all ranks
+    if dist.is_available() and dist.is_initialized():
+        result = torch.tensor([val_loss, bpb], dtype=torch.float64, device=device)
+        dist.broadcast(result, src=0)
+        val_loss, bpb = float(result[0].item()), float(result[1].item())
+
+    base_model.train()
+    return val_loss, bpb
+
+
+# -----------------------------
 # INT6 MIXED QUANTIZATION (transplanted from working diagnostic scripts)
 # -----------------------------
 
@@ -1866,6 +2058,24 @@ def main() -> None:
             f"stride:{args.eval_stride} eval_time:{1000.0 * (time.perf_counter() - t_slide):.0f}ms"
         )
         log0(f"final_int6_sliding_window_exact val_loss:{sw_val_loss:.8f} val_bpb:{sw_val_bpb:.8f}")
+
+    # PPM-C blended sliding window eval
+    if args.ppm_enabled and args.eval_stride > 0 and args.eval_stride < sw_seq_len:
+        torch.cuda.synchronize()
+        t_ppm = time.perf_counter()
+        log0(f"ppm:start alpha={args.ppm_alpha} max_order={args.ppm_max_order}")
+        ppm_val_loss, ppm_val_bpb = eval_val_sliding_with_ppm(
+            args, eval_model, rank, world_size, device,
+            val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+            stride=args.eval_stride, alpha=args.ppm_alpha,
+            ppm_max_order=args.ppm_max_order, eval_seq_len=sw_seq_len, log_fn=log0,
+        )
+        torch.cuda.synchronize()
+        log0(
+            f"final_ppm_sliding_window val_loss:{ppm_val_loss:.4f} val_bpb:{ppm_val_bpb:.4f} "
+            f"alpha:{args.ppm_alpha} eval_time:{1000.0 * (time.perf_counter() - t_ppm):.0f}ms"
+        )
+        log0(f"final_ppm_sliding_window_exact val_loss:{ppm_val_loss:.8f} val_bpb:{ppm_val_bpb:.8f}")
 
     # Second sliding window eval at stride=64 for submission comparison
     if args.eval_stride != 64 and 64 < sw_seq_len:
