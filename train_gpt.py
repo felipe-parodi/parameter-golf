@@ -1024,22 +1024,21 @@ def eval_val_sliding(
                 s = 0 if ws == 0 else max(wlen - stride, 0)
 
                 if ppm_nlls is not None:
-                    # Blend neural + PPM probabilities per scored token
-                    for j in range(s, wlen):
-                        global_pos = ws + j + 1
-                        nll_n = float(nll[i, j].item())
-                        nll_p = float(ppm_nlls[global_pos])
-                        p_n = math.exp(-nll_n) if nll_n < 50 else 0.0
-                        p_p = math.exp(-nll_p) if nll_p < 50 else 0.0
-                        p_mix = ppm_alpha * p_n + (1.0 - ppm_alpha) * p_p
-                        loss_sum += -math.log(max(p_mix, 1e-30))
-                        token_count += 1.0
-                        tgt_id = int(y_batch[i, j].item())
-                        prev_id = int(x_batch[i, j].item())
-                        tb = float(base_bytes_lut[tgt_id].item())
-                        if bool(has_leading_space_lut[tgt_id].item()) and not bool(is_boundary_token_lut[prev_id].item()):
-                            tb += 1.0
-                        byte_count += tb
+                    # Vectorized blend of neural + PPM probabilities
+                    gpos = np.arange(ws + s + 1, ws + wlen + 1)
+                    nll_n = nll[i, s:wlen].cpu().numpy().astype(np.float64)
+                    nll_p = ppm_nlls[gpos]
+                    p_n = np.exp(-np.minimum(nll_n, 50.0))
+                    p_p = np.exp(-np.minimum(nll_p, 50.0))
+                    p_mix = ppm_alpha * p_n + (1.0 - ppm_alpha) * p_p
+                    nll_mix = -np.log(np.maximum(p_mix, 1e-30))
+                    loss_sum += float(nll_mix.sum())
+                    token_count += float(wlen - s)
+                    tgt = y_batch[i, s:wlen]
+                    prev = x_batch[i, s:wlen]
+                    tb = base_bytes_lut[tgt].to(torch.float64)
+                    tb += (has_leading_space_lut[tgt] & ~is_boundary_token_lut[prev]).to(torch.float64)
+                    byte_count += tb.sum()
                 else:
                     scored_nll = nll[i, s:wlen].to(torch.float64)
                     loss_sum += scored_nll.sum()
