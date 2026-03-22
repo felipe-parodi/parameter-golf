@@ -13,7 +13,9 @@
 | 10 | Two-phase TTT | 1.1413 | +0.0080 | 1.1262 | 16.15 MB ❌ | over cap |
 | 11 | + Grad quant | 1.1427 | +0.0055 | 1.1250 | 16.06 MB ❌ | over cap |
 | 12 | Z-loss + no Late QAT | 1.1443 | +0.0063 | 1.1274 | 15.98 MB | worse |
+| 12 | Z-loss + no Late QAT | 1.1443 | +0.0063 | 1.1274 | 15.98 MB | worse |
 | 14 | TTT(20ep,0.008,frz=2)+PPM | 1.1413 | +0.0301 | 1.1488 | — | ❌ catastrophic |
+| 15 ⭐ | TTT(20ep,0.008,**frz=0**)+noQAT+noXSA | 1.1418 | +0.0028 | **1.1213** | 15.53 MB | **NEW BEST** |
 | 12 | + Z-loss + no Late QAT | 1.1443 | +0.0063 | 1.1274 | 15.98 MB | ❌ worse |
 | 13 | PPM + TTT (crashed x2) | 1.1415 | +0.0056 | 1.1237 | 15.91 MB | PPM NCCL timeout |
 
@@ -66,18 +68,27 @@
 - **Verdict**: Catastrophic. Aggressive TTT with 2 frozen blocks destroys the model. PPM blending on a degraded model pulls toward weaker predictions. ❌
 - **Root cause**: PR #388 uses FREEZE_BLOCKS=0. Freezing 2 blocks creates internal inconsistency — unfrozen layers overfit while frozen layers can't adapt.
 
-## PR #388 Analysis (the actual SOTA at 1.1231)
-Key differences from our config:
-- **TTT_FREEZE_BLOCKS=0** (we use 2!) — they unfreeze everything
-- **LATE_QAT=0** — they say it's "catastrophic with SWA"
-- **XSA_LAST_N=0** — no XSA (too slow without FA3)
-- **EMA_ENABLED=0** — Tight SWA instead of EMA
-- **VE_ENABLED=1** — Shared Value Embeddings (we don't have this)
-- **cuDNN SDPA** — different attention backend
+## Run 15: TTT(20ep,0.008,freeze=0) + noQAT + noXSA + PPM — 8xH100 SXM ⭐ NEW BEST
+- **Config**: EMA + TTT_EPOCHS=20 TTT_LR=0.008 TTT_FREEZE_BLOCKS=0 LATE_QAT=0 XSA_LAST_N=0 + PPM
+- **Steps**: 7386, Seed 1337, ~81.2ms/step (faster: no XSA overhead)
+- **Results**:
+  - Pre-quant: 1.1418 | Quant gap: **+0.0028** (half of Run 4!)
+  - Roundtrip: 1.1446
+  - TTT loss: 1.9406 → 1.9335 (-0.007, much better than freeze=2)
+  - **Sliding window: 1.1213** ⭐ (beats PR #388's 1.1231)
+  - PPM sliding: 1.1350 ❌ (PPM hurts strong models)
+  - Artifact: 15.53 MB ✓
+  - TTT time: 292s | Total eval: ~375s
+- **Key findings**:
+  - FREEZE_BLOCKS=0 is critical — lets all layers adapt coherently
+  - No Late QAT keeps weights clean for TTT
+  - No XSA saves ~1.4ms/step → more training steps
+  - PPM confirmed dead on strong baselines (adds noise)
+
+## Confirmed Dead: PPM-C
+PPM hurts on strong baselines (1.1350 vs 1.1213 without it). The neural model already captures bigram patterns — blending 5% weak signal just adds noise. Would need alpha=0.999+ to not hurt, at which point gain is negligible.
 
 ## Next Steps
-- [ ] Try **TTT_FREEZE_BLOCKS=0** — match PR #388's freeze strategy
-- [ ] Try **LATE_QAT=0** — match PR #388
-- [ ] Consider implementing Shared Value Embeddings (VE128)
-- [ ] PPM alpha/order sweep once base TTT is working
-- [ ] 3-seed submission runs
+- [ ] **SEED=42**: verify Run 15 config consistency
+- [ ] **SEED=2025**: third seed for p<0.01
+- [ ] If consistent: prepare submission PR
