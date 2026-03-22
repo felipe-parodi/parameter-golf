@@ -113,19 +113,48 @@ This heuristic from PR #375 held true in all our runs. Any technique that adds p
 - **`runpodctl send/receive`** for file transfer between pod and local machine.
 - **landscape.md** tracks the full competitive field — update at start of each session.
 
-## Ideas for Next Session
-- [ ] Check PR #398 review status and feedback
-- [ ] Scan for new SOTA (competition moves fast — 20+ PRs/day)
-- [ ] Try TTT_EPOCHS=25 (match PR #388, we have eval budget headroom)
-- [ ] Implement Shared Value Embeddings (VE128) from PR #374/388
-- [ ] Try 12L architecture (NUM_LAYERS=12 MLP_HIDDEN=1408) — more capacity
-- [ ] Try cuDNN SDPA instead of FA3 (PR #388 claims 1.18x faster for GQA)
-- [ ] GPTQ-lite clip percentile search (PR #379) — zero-cost quant refinement
-- [ ] Int5 uniform + 10% pruning (PR #389) — save artifact bytes
-- [ ] Consider combining TTT with eval-time bigram cache at very low alpha (0.01-0.05)
+## CRITICAL UPDATE: TTT "Not in Spirit" (2026-03-22)
+
+From Issue #140 (live AI commentary) and organizer @cocohearts on PR #317:
+- **TTT is "not in the spirit of the challenge"**
+- **PR #388 (25-epoch TTT) was CLOSED** — pre-eval TTT ruled invalid
+- Our PR #398 is flagged with ⚠️ for TTT usage
+- 5 TTT variants confirmed dead at frontier by PR #375's $500 study
+- **Best non-TTT validated: PR #315 at 1.1250 BPB**
+
+This means: **our TTT-based 1.1221 may not be accepted as a record.** We need a non-TTT path.
+
+### Our Position Without TTT
+Run 15 pre-quant: 1.1418 → post-quant roundtrip: 1.1446 (before TTT)
+Sliding window without TTT would be approximately: **~1.125** (estimated from roundtrip - sliding gain of ~0.020)
+This matches #315's 1.1250. We are NOT ahead without TTT.
+
+### Non-TTT Path: What Could Beat 1.1250?
+
+**Highest priority (from Issue #140's untried combos):**
+1. **OptRot pre-quantization** (arXiv:2512.24124) — rotation matrix redistributes weight outliers before int6. Reduces quant gap 30-50%. Zero artifact cost. Drop-in. Est. -0.002 to -0.005 BPB.
+2. **FP8 forward pass** (torchao) — H100 does 2x TFLOPS in FP8 E4M3 vs BF16. 20-40% more training steps. Systems-only (significance waived). Est. -0.003 to -0.008 BPB.
+3. **2:4 structured sparsity** — relu² is already 84-98% sparse; enforce NVIDIA 2:4 pattern for 2x sparse matmul. ~15-20% more steps. Systems-only. Est. -0.003 to -0.008 BPP.
+4. **Liger-Kernel fused ops** — fused RMSNorm (6x), fused CE (1.7x), pip-installable. 20-43% throughput. Systems-only. Est. -0.002 to -0.006 BPB.
+5. **DyT (Dynamic Tanh)** (arXiv:2503.10622) — replace RMSNorm with tanh(α·x). Saves 1-2ms/step. 1-line change. Est. -0.001 to -0.004 BPB.
+6. **Mousse optimizer** (arXiv:2603.09697) — curvature-aware Muon. 12% more effective at 3% overhead. Drop-in. Est. -0.003 to -0.008 BPB.
+7. **VE128 (Shared Value Embeddings)** — from PR #374. Novel architecture component.
+8. **GPTQ-lite** (PR #379) — per-layer optimal clip search. Zero training cost.
+
+**Key insight from #140:** "Each 1ms step overhead = 0.006 BPB cost." Systems optimizations (FP8, fused kernels, sparsity) that increase throughput are the highest-EV path at the frontier. Significance test is WAIVED for systems-only changes.
+
+## Ideas for Session 2 (Non-TTT Focus)
+- [ ] **OptRot pre-quantization** — directly reduces quant gap, zero artifact cost
+- [ ] **Liger-Kernel fused ops** — pip install, 20-43% throughput
+- [ ] **DyT (Dynamic Tanh)** — 1-line RMSNorm replacement, saves 1-2ms/step
+- [ ] **FP8 forward pass** — 2x TFLOPS, 20-40% more steps
+- [ ] **Mousse optimizer** — drop-in Muon replacement
+- [ ] **VE128** — shared value embeddings (PR #374)
+- [ ] **GPTQ-lite clip search** — zero-cost quant refinement
+- [ ] Request additional compute from OpenAI ($1M pool)
 
 ## Timeline
-- Session 1: 2026-03-21/22 (this session)
-- PR #398 submitted: https://github.com/openai/parameter-golf/pull/398
+- Session 1: 2026-03-21/22 — 15 runs, submitted PR #398 (1.1221, TTT-based)
+- **Session 2 priority: non-TTT submission beating 1.1250**
 - Competition ends: 2026-04-30 (~5.5 weeks remaining)
-- Budget: ~$67 (~12 full runs on 8xH100 SXM)
+- Budget: ~$67 remaining + potential OpenAI compute grant
