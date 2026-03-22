@@ -54,15 +54,25 @@
 - ✅ Partial RoPE (16/64 dims)
 - ✅ 1ms overhead = 0.006 BPB cost (PR #375 meta-insight)
 
-## Next Experiment: Aggressive TTT + PPM (Run 14)
-- **Config**: Run 4 base + TTT_EPOCHS=25 TTT_LR=0.008 + PPM_ENABLED=1 PPM_ALPHA=0.95 PPM_MAX_ORDER=2
-- **Hypothesis**: Aggressive TTT matches PR #388 (1.1231). PPM adds 0.003-0.005 on top → ~1.118-1.120.
-- **What's novel**: PPM-C blending is our unique contribution. Nobody else combines classical compression with aggressive TTT.
-- **Timing budget**: Training 600s + TTT 25ep ~400s? + PPM precompute ~90s + sliding window 74s. TTT timing is the unknown — 25 epochs is 8x more than our 3. May need to check if it fits in 600s eval.
+## Run 14: Aggressive TTT(20ep,lr=0.008) + PPM — 8xH100 SXM [IN PROGRESS]
+- **Config**: Run 4 + TTT_EPOCHS=20 TTT_LR=0.008 TTT_FREEZE_BLOCKS=2 + PPM
+- **Steps**: 7262, Seed 1337
+- **Results so far**: Pre-quant 1.1413 | Roundtrip **1.1714 ❌** (quant gap +0.030!)
+- **Problem**: Aggressive TTT with frozen blocks causes weight drift. TTT loss barely moved (1.9383→1.9361) but model degraded.
+- Waiting for sliding window + PPM results...
 
-## Remaining Ideas (if Run 14 works)
-- [ ] PPM alpha sweep (0.90, 0.95, 0.99) — tune the blend ratio
-- [ ] PPM max_order sweep (1, 2, 3, 4)
+## PR #388 Analysis (the actual SOTA at 1.1231)
+Key differences from our config:
+- **TTT_FREEZE_BLOCKS=0** (we use 2!) — they unfreeze everything
+- **LATE_QAT=0** — they say it's "catastrophic with SWA"
+- **XSA_LAST_N=0** — no XSA (too slow without FA3)
+- **EMA_ENABLED=0** — Tight SWA instead of EMA
+- **VE_ENABLED=1** — Shared Value Embeddings (we don't have this)
+- **cuDNN SDPA** — different attention backend
+
+## Next Steps
+- [ ] Try **TTT_FREEZE_BLOCKS=0** — match PR #388's freeze strategy
+- [ ] Try **LATE_QAT=0** — match PR #388
+- [ ] Consider implementing Shared Value Embeddings (VE128)
+- [ ] PPM alpha/order sweep once base TTT is working
 - [ ] 3-seed submission runs
-- [ ] GPTQ-lite clip percentile search (PR #379) — zero-cost quant refinement
-- [ ] Int5 uniform + 10% pruning (PR #389) — save artifact bytes
