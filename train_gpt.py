@@ -1269,8 +1269,8 @@ def eval_val_sliding_with_ppm(
     my_e = (total_windows * (rank + 1)) // world_size
     my_windows = window_starts[my_s:my_e]
 
-    # Per-token NLL storage (only for this rank's scored tokens)
-    local_nlls: dict[int, float] = {}
+    # Per-token NLL tensor — each rank fills its scored positions, then all-reduce
+    per_token_nlls = torch.zeros(total_tokens + 2, dtype=torch.float64, device=device)
 
     base_model.eval()
     compiled_logits = torch.compile(base_model.forward_logits, dynamic=False, fullgraph=True)
@@ -1300,32 +1300,16 @@ def eval_val_sliding_with_ppm(
                 s = 0 if ws == 0 else max(wlen - stride, 0)
                 for j in range(s, wlen):
                     global_target_pos = ws + j + 1
-                    local_nlls[global_target_pos] = float(nll[i, j].item())
+                    per_token_nlls[global_target_pos] = nll[i, j].to(torch.float64)
 
-    # Gather all NLLs to rank 0 for PPM blending
+    # All-reduce: each position scored by exactly one rank, so SUM gathers all
     if dist.is_available() and dist.is_initialized():
-        import pickle
-        if rank == 0:
-            all_nlls = dict(local_nlls)
-            for src in range(1, world_size):
-                buf_size = torch.zeros(1, dtype=torch.long, device=device)
-                dist.recv(buf_size, src=src)
-                buf = torch.zeros(int(buf_size.item()), dtype=torch.uint8, device="cpu")
-                dist.recv(buf, src=src)
-                remote_nlls = pickle.loads(buf.numpy().tobytes())
-                all_nlls.update(remote_nlls)
-        else:
-            data = pickle.dumps(local_nlls)
-            buf_size = torch.tensor([len(data)], dtype=torch.long, device=device)
-            dist.send(buf_size, dst=0)
-            buf = torch.frombuffer(bytearray(data), dtype=torch.uint8).to("cpu")
-            dist.send(buf, dst=0)
-            all_nlls = {}
-        dist.barrier()
-    else:
-        all_nlls = local_nlls
+        dist.all_reduce(per_token_nlls, op=dist.ReduceOp.SUM)
 
     # Phase 2: PPM blend (rank 0 only, CPU)
+    all_nlls_cpu = per_token_nlls.cpu()
+    del per_token_nlls
+
     if rank == 0:
         tokens_np = val_tokens.numpy().astype(int)
         base_bytes_cpu = base_bytes_lut.cpu()
@@ -1337,13 +1321,15 @@ def eval_val_sliding_with_ppm(
         blend_byte_sum = 0.0
         scored_count = 0
 
+        nlls_np = all_nlls_cpu.numpy()
+
         for t in range(1, total_tokens + 1):
             target = int(tokens_np[t])
             context = tuple(tokens_np[max(0, t - ppm_max_order):t])
             p_ppm = ppm.predict_and_update(context, target)
 
-            if t in all_nlls:
-                nll_neural = all_nlls[t]
+            nll_neural = float(nlls_np[t])
+            if nll_neural > 0:  # scored position (non-zero NLL)
                 p_neural = math.exp(-nll_neural) if nll_neural < 50 else 0.0
                 p_mix = alpha * p_neural + (1.0 - alpha) * p_ppm
                 nll_mix = -math.log(max(p_mix, 1e-30))
