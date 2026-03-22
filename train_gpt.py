@@ -1258,21 +1258,73 @@ class PPMModel:
 
 def precompute_ppm_probs(val_tokens: Tensor, max_order: int, vocab_size: int,
                          log_fn=None) -> np.ndarray:
-    """Precompute PPM log-probabilities for all val token positions. ~60-120s on CPU."""
-    tokens_np = val_tokens.numpy().astype(int)
-    total = len(tokens_np) - 1
-    ppm = PPMModel(max_order=max_order, vocab_size=vocab_size)
-    # Store -log(p_ppm) for each target position (1-indexed)
-    ppm_nlls = np.zeros(total + 2, dtype=np.float64)
-    for t in range(1, total + 1):
-        target = int(tokens_np[t])
-        ctx = tuple(tokens_np[max(0, t - max_order):t])
-        p_ppm = ppm.predict_and_update(ctx, target)
-        ppm_nlls[t] = -math.log(max(p_ppm, 1e-30))
+    """Precompute PPM-C NLLs using numpy arrays (fast) for orders 0-1.
+
+    Uses numpy int64 arrays instead of Python dicts — ~3-5x faster.
+    max_order capped at 1 for speed (bigram + unigram + uniform escape).
+    """
+    tokens = val_tokens.numpy().astype(np.int32)
+    N = len(tokens) - 1
+    ppm_nlls = np.zeros(N + 2, dtype=np.float64)
+    inv_vocab = 1.0 / vocab_size
+
+    # Order 0: unigram
+    c0 = np.zeros(vocab_size, dtype=np.int64)
+    t0 = 0
+    u0 = 0
+
+    # Order 1: bigram (prev → target)
+    c1 = np.zeros((vocab_size, vocab_size), dtype=np.int64)
+    t1 = np.zeros(vocab_size, dtype=np.int64)
+    u1 = np.zeros(vocab_size, dtype=np.int64)
+
+    t_start = time.perf_counter()
+    for t in range(1, N + 1):
+        target = int(tokens[t])
+        prev = int(tokens[t - 1])
+
+        # PPM-C predict: order 1 → order 0 → uniform
+        prob = 0.0
+        escape = 1.0
+
+        # Order 1 (bigram)
+        if t1[prev] > 0:
+            denom = int(t1[prev]) + int(u1[prev])
+            sc = int(c1[prev, target])
+            if sc > 0:
+                prob += escape * (sc / denom)
+            escape *= int(u1[prev]) / denom
+
+        # Order 0 (unigram)
+        if t0 > 0:
+            denom = t0 + u0
+            sc = int(c0[target])
+            if sc > 0:
+                prob += escape * (sc / denom)
+            escape *= u0 / denom
+
+        # Uniform escape
+        prob += escape * inv_vocab
+        ppm_nlls[t] = -math.log(max(prob, 1e-30))
+
+        # Update counts
+        if c1[prev, target] == 0:
+            u1[prev] += 1
+        c1[prev, target] += 1
+        t1[prev] += 1
+        if c0[target] == 0:
+            u0 += 1
+        c0[target] += 1
+        t0 += 1
+
         if log_fn and t % 10_000_000 == 0:
-            log_fn(f"ppm_precompute:progress {t}/{total}")
+            elapsed = time.perf_counter() - t_start
+            rate = t / elapsed
+            eta = (N - t) / rate
+            log_fn(f"ppm_precompute:{t}/{N} rate={rate:.0f}tok/s eta={eta:.0f}s")
+
     if log_fn:
-        log_fn(f"ppm_precompute:done tokens={total}")
+        log_fn(f"ppm_precompute:done tokens={N} elapsed={time.perf_counter()-t_start:.1f}s")
     return ppm_nlls
 
 
