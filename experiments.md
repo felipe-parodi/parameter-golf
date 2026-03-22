@@ -63,6 +63,7 @@
 - ❌ Batch 524K — fewer tokens/step not compensated (Run 7)
 - ❌ Tight SWA — worse quant gap than EMA (Run 8)
 - ❌ Two-phase TTT — phase 2 adds nothing after standard TTT (Run 10)
+- ❌ Grad quant — reduces quant gap but adds overhead + over artifact cap (Run 11)
 - ❌ Depth recurrence — 900x quant error amplification (PR #363)
 
 ## Run 9: Causal TTT (NOVEL) + EMA + FA3 — 8xH100 SXM
@@ -92,8 +93,16 @@
 - **Quant gap reduced** by grad quant (0.0055 vs 0.0058) but offset by overhead
 - **Ceiling**: ~1.124 with current 11L/512d meta
 
+## Run 11: Grad Quant + TTT + FA3 — 8xH100 SXM
+- **Config**: Run 4 + GRAD_QUANT=1 (adaptive int5/int6/int7 per tensor)
+- **Steps**: 7139, Seed 1337, ~84.0ms/step (slower due to grad accumulation overhead)
+- **Results**: Sliding **1.1250** | Roundtrip 1.1482 | Pre-quant 1.1427 | Quant gap +0.0055 | **Artifact 16.06 MB ❌ OVER CAP**
+- **Quant distribution**: {int5: 13, int6: 47, int7: 6, int8: 2}
+- **Verdict**: Quant gap improved (0.0055 vs 0.0058 ✓) but overhead cost ~117 steps AND artifact over 16 MB. The int7 tensors cost more bytes than int5 saves. ❌
+
 ## Key Insight
 The remaining BPB gains likely come from **eval-time techniques** (not training):
 - PPM-C classical probability mixing (PR #283): -0.003 to -0.008 BPB, zero artifact
 - Neural Cache cross-window KV (PR #318): extend context to full documents
 - These compose with TTT and cost zero training budget
+- **PPM-C is now implemented** — ready to test
