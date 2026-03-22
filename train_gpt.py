@@ -971,8 +971,10 @@ def eval_val_sliding(
     stride: int,
     batch_seqs: int = 32,
     eval_seq_len: int | None = None,
+    ppm_nlls: np.ndarray | None = None,
+    ppm_alpha: float = 0.95,
 ) -> tuple[float, float]:
-    """Sliding window evaluation: each token scored with maximum context."""
+    """Sliding window evaluation with optional PPM-C probability blending."""
     seq_len = eval_seq_len or args.train_seq_len
     total_tokens = val_tokens.numel() - 1
 
@@ -1020,14 +1022,33 @@ def eval_val_sliding(
             for i, ws in enumerate(batch_ws):
                 wlen = wlens[i]
                 s = 0 if ws == 0 else max(wlen - stride, 0)
-                scored_nll = nll[i, s:wlen].to(torch.float64)
-                loss_sum += scored_nll.sum()
-                token_count += float(wlen - s)
-                tgt = y_batch[i, s:wlen]
-                prev = x_batch[i, s:wlen]
-                tb = base_bytes_lut[tgt].to(torch.float64)
-                tb += (has_leading_space_lut[tgt] & ~is_boundary_token_lut[prev]).to(torch.float64)
-                byte_count += tb.sum()
+
+                if ppm_nlls is not None:
+                    # Blend neural + PPM probabilities per scored token
+                    for j in range(s, wlen):
+                        global_pos = ws + j + 1
+                        nll_n = float(nll[i, j].item())
+                        nll_p = float(ppm_nlls[global_pos])
+                        p_n = math.exp(-nll_n) if nll_n < 50 else 0.0
+                        p_p = math.exp(-nll_p) if nll_p < 50 else 0.0
+                        p_mix = ppm_alpha * p_n + (1.0 - ppm_alpha) * p_p
+                        loss_sum += -math.log(max(p_mix, 1e-30))
+                        token_count += 1.0
+                        tgt_id = int(y_batch[i, j].item())
+                        prev_id = int(x_batch[i, j].item())
+                        tb = float(base_bytes_lut[tgt_id].item())
+                        if bool(has_leading_space_lut[tgt_id].item()) and not bool(is_boundary_token_lut[prev_id].item()):
+                            tb += 1.0
+                        byte_count += tb
+                else:
+                    scored_nll = nll[i, s:wlen].to(torch.float64)
+                    loss_sum += scored_nll.sum()
+                    token_count += float(wlen - s)
+                    tgt = y_batch[i, s:wlen]
+                    prev = x_batch[i, s:wlen]
+                    tb = base_bytes_lut[tgt].to(torch.float64)
+                    tb += (has_leading_space_lut[tgt] & ~is_boundary_token_lut[prev]).to(torch.float64)
+                    byte_count += tb.sum()
 
     if dist.is_available() and dist.is_initialized():
         dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
@@ -1236,131 +1257,24 @@ class PPMModel:
         return prob
 
 
-def eval_val_sliding_with_ppm(
-    args: Hyperparameters,
-    base_model: nn.Module,
-    rank: int,
-    world_size: int,
-    device: torch.device,
-    val_tokens: Tensor,
-    base_bytes_lut: Tensor,
-    has_leading_space_lut: Tensor,
-    is_boundary_token_lut: Tensor,
-    stride: int,
-    alpha: float = 0.95,
-    ppm_max_order: int = 3,
-    batch_seqs: int = 32,
-    eval_seq_len: int | None = None,
-    log_fn=None,
-) -> tuple[float, float]:
-    """Sliding window eval with PPM-C probability blending.
-
-    Phase 1 (GPU): standard sliding window, stores per-token NLLs.
-    Phase 2 (CPU): PPM pass over val tokens, blends with neural NLLs, computes BPB.
-    """
-    seq_len = eval_seq_len or args.train_seq_len
-    total_tokens = val_tokens.numel() - 1
-
-    # Phase 1: Neural sliding window — store per-token NLLs
-    window_starts = [ws for ws in range(0, total_tokens, stride)
-                     if min(ws + seq_len, total_tokens) - ws >= 1]
-    total_windows = len(window_starts)
-    my_s = (total_windows * rank) // world_size
-    my_e = (total_windows * (rank + 1)) // world_size
-    my_windows = window_starts[my_s:my_e]
-
-    # Per-token NLL tensor — each rank fills its scored positions, then all-reduce
-    per_token_nlls = torch.zeros(total_tokens + 2, dtype=torch.float64, device=device)
-
-    base_model.eval()
-    compiled_logits = torch.compile(base_model.forward_logits, dynamic=False, fullgraph=True)
-
-    with torch.inference_mode():
-        for bi in range(0, len(my_windows), batch_seqs):
-            batch_ws = my_windows[bi:bi + batch_seqs]
-            bsz = len(batch_ws)
-            x_batch = torch.zeros(bsz, seq_len, dtype=torch.int64, device=device)
-            y_batch = torch.zeros(bsz, seq_len, dtype=torch.int64, device=device)
-            wlens: list[int] = []
-            for i, ws in enumerate(batch_ws):
-                end = min(ws + seq_len, total_tokens)
-                wlen = end - ws
-                wlens.append(wlen)
-                chunk = val_tokens[ws:end + 1].to(dtype=torch.int64, device=device)
-                x_batch[i, :wlen] = chunk[:-1]
-                y_batch[i, :wlen] = chunk[1:]
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                logits = compiled_logits(x_batch)
-            nll = F.cross_entropy(
-                logits.reshape(-1, logits.size(-1)).float(),
-                y_batch.reshape(-1), reduction="none",
-            ).reshape(bsz, seq_len)
-            for i, ws in enumerate(batch_ws):
-                wlen = wlens[i]
-                s = 0 if ws == 0 else max(wlen - stride, 0)
-                for j in range(s, wlen):
-                    global_target_pos = ws + j + 1
-                    per_token_nlls[global_target_pos] = nll[i, j].to(torch.float64)
-
-    # All-reduce: each position scored by exactly one rank, so SUM gathers all
-    if dist.is_available() and dist.is_initialized():
-        dist.all_reduce(per_token_nlls, op=dist.ReduceOp.SUM)
-
-    # Phase 2: PPM blend (rank 0 only, CPU)
-    all_nlls_cpu = per_token_nlls.cpu()
-    del per_token_nlls
-
-    if rank == 0:
-        tokens_np = val_tokens.numpy().astype(int)
-        base_bytes_cpu = base_bytes_lut.cpu()
-        has_leading_space_cpu = has_leading_space_lut.cpu()
-        is_boundary_cpu = is_boundary_token_lut.cpu()
-
-        ppm = PPMModel(max_order=ppm_max_order, vocab_size=args.vocab_size)
-        blend_nll_sum = 0.0
-        blend_byte_sum = 0.0
-        scored_count = 0
-
-        nlls_np = all_nlls_cpu.numpy()
-
-        for t in range(1, total_tokens + 1):
-            target = int(tokens_np[t])
-            context = tuple(tokens_np[max(0, t - ppm_max_order):t])
-            p_ppm = ppm.predict_and_update(context, target)
-
-            nll_neural = float(nlls_np[t])
-            if nll_neural > 0:  # scored position (non-zero NLL)
-                p_neural = math.exp(-nll_neural) if nll_neural < 50 else 0.0
-                p_mix = alpha * p_neural + (1.0 - alpha) * p_ppm
-                nll_mix = -math.log(max(p_mix, 1e-30))
-                blend_nll_sum += nll_mix
-
-                prev = int(tokens_np[t - 1])
-                byte_count = float(base_bytes_cpu[target].item())
-                if bool(has_leading_space_cpu[target].item()) and not bool(is_boundary_cpu[prev].item()):
-                    byte_count += 1.0
-                blend_byte_sum += byte_count
-                scored_count += 1
-
-            if log_fn and t % 10_000_000 == 0:
-                log_fn(f"ppm:progress {t}/{total_tokens} scored:{scored_count}")
-
-        bpb = (blend_nll_sum / math.log(2.0)) / blend_byte_sum if blend_byte_sum > 0 else 0.0
-        val_loss = blend_nll_sum / scored_count if scored_count > 0 else 0.0
-        if log_fn:
-            log_fn(f"ppm:done scored:{scored_count} val_loss:{val_loss:.4f} val_bpb:{bpb:.4f}")
-    else:
-        bpb = 0.0
-        val_loss = 0.0
-
-    # Broadcast result to all ranks
-    if dist.is_available() and dist.is_initialized():
-        result = torch.tensor([val_loss, bpb], dtype=torch.float64, device=device)
-        dist.broadcast(result, src=0)
-        val_loss, bpb = float(result[0].item()), float(result[1].item())
-
-    base_model.train()
-    return val_loss, bpb
+def precompute_ppm_probs(val_tokens: Tensor, max_order: int, vocab_size: int,
+                         log_fn=None) -> np.ndarray:
+    """Precompute PPM log-probabilities for all val token positions. ~60-120s on CPU."""
+    tokens_np = val_tokens.numpy().astype(int)
+    total = len(tokens_np) - 1
+    ppm = PPMModel(max_order=max_order, vocab_size=vocab_size)
+    # Store -log(p_ppm) for each target position (1-indexed)
+    ppm_nlls = np.zeros(total + 2, dtype=np.float64)
+    for t in range(1, total + 1):
+        target = int(tokens_np[t])
+        ctx = tuple(tokens_np[max(0, t - max_order):t])
+        p_ppm = ppm.predict_and_update(ctx, target)
+        ppm_nlls[t] = -math.log(max(p_ppm, 1e-30))
+        if log_fn and t % 10_000_000 == 0:
+            log_fn(f"ppm_precompute:progress {t}/{total}")
+    if log_fn:
+        log_fn(f"ppm_precompute:done tokens={total}")
+    return ppm_nlls
 
 
 # -----------------------------
@@ -2051,17 +1965,23 @@ def main() -> None:
     if args.ppm_enabled and args.eval_stride > 0 and args.eval_stride < sw_seq_len:
         torch.cuda.synchronize()
         t_ppm = time.perf_counter()
-        log0(f"ppm:start alpha={args.ppm_alpha} max_order={args.ppm_max_order}")
-        ppm_val_loss, ppm_val_bpb = eval_val_sliding_with_ppm(
+        log0(f"ppm:start precomputing alpha={args.ppm_alpha} max_order={args.ppm_max_order}")
+        # Step 1: precompute PPM probs (CPU, all ranks independently, ~60-120s)
+        ppm_nll_array = precompute_ppm_probs(val_tokens, args.ppm_max_order, args.vocab_size, log_fn=log0)
+        log0(f"ppm:precompute done, elapsed={time.perf_counter() - t_ppm:.1f}s")
+        # Step 2: re-run sliding window with PPM blending (reuses compiled model)
+        t_ppm2 = time.perf_counter()
+        ppm_val_loss, ppm_val_bpb = eval_val_sliding(
             args, eval_model, rank, world_size, device,
             val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
-            stride=args.eval_stride, alpha=args.ppm_alpha,
-            ppm_max_order=args.ppm_max_order, eval_seq_len=sw_seq_len, log_fn=log0,
+            stride=args.eval_stride, eval_seq_len=sw_seq_len,
+            ppm_nlls=ppm_nll_array, ppm_alpha=args.ppm_alpha,
         )
         torch.cuda.synchronize()
         log0(
             f"final_ppm_sliding_window val_loss:{ppm_val_loss:.4f} val_bpb:{ppm_val_bpb:.4f} "
-            f"alpha:{args.ppm_alpha} eval_time:{1000.0 * (time.perf_counter() - t_ppm):.0f}ms"
+            f"alpha:{args.ppm_alpha} eval_time:{1000.0 * (time.perf_counter() - t_ppm):.0f}ms "
+            f"(precompute:{time.perf_counter() - t_ppm - (time.perf_counter() - t_ppm2):.0f}s slide:{time.perf_counter() - t_ppm2:.0f}s)"
         )
         log0(f"final_ppm_sliding_window_exact val_loss:{ppm_val_loss:.8f} val_bpb:{ppm_val_bpb:.8f}")
 
