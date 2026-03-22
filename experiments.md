@@ -12,6 +12,8 @@
 | 9 | Causal TTT only | 1.1416 | +0.0077 | 1.1262 | 15.56 MB | faster but worse |
 | 10 | Two-phase TTT | 1.1413 | +0.0080 | 1.1262 | 16.15 MB ❌ | over cap |
 | 11 | + Grad quant | 1.1427 | +0.0055 | 1.1250 | 16.06 MB ❌ | over cap |
+| 12 | Z-loss + no Late QAT | 1.1443 | +0.0063 | 1.1274 | 15.98 MB | worse |
+| 14 | TTT(20ep,0.008,frz=2)+PPM | 1.1413 | +0.0301 | 1.1488 | — | ❌ catastrophic |
 | 12 | + Z-loss + no Late QAT | 1.1443 | +0.0063 | 1.1274 | 15.98 MB | ❌ worse |
 | 13 | PPM + TTT (crashed x2) | 1.1415 | +0.0056 | 1.1237 | 15.91 MB | PPM NCCL timeout |
 
@@ -54,12 +56,15 @@
 - ✅ Partial RoPE (16/64 dims)
 - ✅ 1ms overhead = 0.006 BPB cost (PR #375 meta-insight)
 
-## Run 14: Aggressive TTT(20ep,lr=0.008) + PPM — 8xH100 SXM [IN PROGRESS]
-- **Config**: Run 4 + TTT_EPOCHS=20 TTT_LR=0.008 TTT_FREEZE_BLOCKS=2 + PPM
+## Run 14: Aggressive TTT(20ep,lr=0.008,freeze=2) + PPM — 8xH100 SXM ❌
+- **Config**: Run 4 + TTT_EPOCHS=20 TTT_LR=0.008 TTT_FREEZE_BLOCKS=2 + PPM_ALPHA=0.95
 - **Steps**: 7262, Seed 1337
-- **Results so far**: Pre-quant 1.1413 | Roundtrip **1.1714 ❌** (quant gap +0.030!)
-- **Problem**: Aggressive TTT with frozen blocks causes weight drift. TTT loss barely moved (1.9383→1.9361) but model degraded.
-- Waiting for sliding window + PPM results...
+- **Results**:
+  - Sliding (no PPM): **1.1488** ❌ (Run 4 was 1.1242)
+  - Sliding + PPM: **1.1639** ❌❌ (PPM made it WORSE)
+  - Roundtrip: 1.1714 | Quant gap: +0.030 (Run 4 was +0.006)
+- **Verdict**: Catastrophic. Aggressive TTT with 2 frozen blocks destroys the model. PPM blending on a degraded model pulls toward weaker predictions. ❌
+- **Root cause**: PR #388 uses FREEZE_BLOCKS=0. Freezing 2 blocks creates internal inconsistency — unfrozen layers overfit while frozen layers can't adapt.
 
 ## PR #388 Analysis (the actual SOTA at 1.1231)
 Key differences from our config:
