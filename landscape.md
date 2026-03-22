@@ -194,14 +194,63 @@ Official merged leaderboard tops out at 1.1428 (PR #180).
 - Error-driven (x - mu) replaces QKV, O(n) via causal cumsum
 - No attention matrix at all. 1.41-1.46 BPB.
 
+## CRITICAL: TTT Ruling (Issue #402, filed 2026-03-22)
+
+Issue #402 challenges the validity of epoch-based TTT (including our PR #398). Argument: full TTT adaptation on all eval tokens before scoring = training on eval set. Only token-by-token backward-looking TTT (score token t, then adapt on tokens ≤ t) may be valid. **No official ruling yet** but organizer @cocohearts already said TTT is "not in spirit" on PR #317.
+
+**Our PR #398 is explicitly listed as potentially invalid in Issue #402.**
+
+## Updated Leaderboard (as of PR #444, 2026-03-22 evening)
+
+### Non-TTT (safe for record track)
+| PR | BPB | Author | Key Innovation |
+|---|---|---|---|
+| #414 | **1.1233** (3-seed) | AbhisekBasu1 | **GPTQ-lite** + EMA + warmdown3500 + QAT@0.15 |
+| #401 | 1.1243 (best) | — | EMA + Tight SWA stacking + Late QAT@0.15 + VE128 |
+| #374 | 1.1246 (1-seed) | unnir | Tight SWA + VE128 + Partial RoPE + LN Scale |
+| #315 | 1.1250 (3-seed) | jfprincz | Partial RoPE + LN Scale + EMA + Late QAT + XSA4 |
+
+### TTT-based (validity disputed, Issue #402)
+| PR | BPB | Author | Key Innovation |
+|---|---|---|---|
+| #442 | **1.1027** (?) | sjp611 | AdamW TTT 10ep — if real, massive jump |
+| #398 | 1.1221 (3-seed) | **us** | EMA + TTT(20ep,lr=0.008,freeze=0) |
+| #417 | 1.1222 (3-seed) | — | Two-Phase TTT: norm recalibration + selective freeze |
+
+## New Techniques Since Session 1 (PRs #390-444)
+
+### Must-Adopt (proven, low-risk)
+- **GPTQ-lite** (PR #414): per-row clip percentile search during int6 quant. 5 candidates per row, pick min MSE. Zero training cost. -0.0006 BPB. NEW NON-TTT SOTA.
+- **Value Residual / ResFormer** (PR #413, arXiv:2410.17897): cache V from layer 0, mix into all layers via 18 learnable scalars. -0.015 BPB. Trivial to add.
+- **Gated Attention** (PR #413, arXiv:2505.06708): per-head sigmoid gate after SDPA. Eliminates attention sinks. ~37K params. -0.003 BPB.
+- **EMA+SWA stacking** (PR #401): run EMA every step, SWA collects from EMA weights. Best of both.
+
+### Promising (novel, higher complexity)
+- **Dynamic Eval** (PR #397, Krause 2018): SGD steps DURING sliding window scoring, not before. Model adapts to local text as it evaluates. -0.024 BPB. May survive TTT ruling since it scores-before-adapts per token.
+- **Two-Phase TTT** (PR #417): Phase 1 = norm-only recalibration (50ep Adam, 22K params). Phase 2 = selective freeze (10ep SGD, last 3 blocks). More defensible TTT.
+- **CANON-AC DeltaGate** (PR #400): learned sigmoid-gated conv on last 5 blocks. 1.1296.
+- **TrigramHash + context gating** (PR #418): extends BigramHash with trigrams + hidden-state-modulated gate.
+- **Parameter Banking + Parallel Muon** (PR #399): batched Newton-Schulz (4 bmm ops vs 66 sequential). 81.87ms/step.
+
+### Nobody Has Implemented Yet (our differentiation)
+- FP8 E4M3 forward pass
+- Liger-Kernel fused Triton ops
+- 2:4 structured activation sparsity
+- OptRot pre-quantization rotation
+- Mousse optimizer
+- DyT (Dynamic Tanh normalization)
+
 ## Key PRs to Watch
-- PR #388 (current SOTA, 1.1231) — Tight SWA + VE128 + aggressive TTT
-- PR #374 (1.1246) — same author lineage as #315, #287
-- PR #384 — eval-time technique stacking (cache + OGD)
-- PR #375 — $500 systematic negative results (invaluable reference)
-- PR #283 — PPM-C eval-time mixing (underexploited)
+- PR #414 (non-TTT SOTA, 1.1233) — GPTQ-lite
+- PR #442 (1.1027 claimed) — AdamW TTT, needs verification
+- PR #417 (two-phase TTT, 1.1222) — may survive TTT ruling
+- PR #397 (dynamic eval, -0.024 BPB) — scores-then-adapts, different from epoch TTT
+- PR #413 (value residual + gated attention) — cheap architectural wins
+- PR #402 (TTT validity challenge) — directly affects our PR #398
+- PR #375 ($500 systematic negatives) — reference for what not to try
 
 ## Competition Timeline
 - Started: March 18, 2026
-- Ends: April 30, 2026
-- ~5.5 weeks remaining as of March 22
+- Session 1: March 21-22 (15 runs, PR #398 submitted, ~$33 spent)
+- Ends: April 30, 2026 (~5.5 weeks remaining)
+- Budget: ~$67 remaining + pending compute grant request
