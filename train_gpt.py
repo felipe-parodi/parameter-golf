@@ -1256,37 +1256,25 @@ class PPMModel:
         return prob
 
 
-def precompute_ppm_probs(val_tokens: Tensor, max_order: int, vocab_size: int,
-                         log_fn=None) -> np.ndarray:
-    """Precompute PPM-C NLLs using numpy arrays (fast) for orders 0-1.
+try:
+    from numba import njit
+    _HAS_NUMBA = True
+except ImportError:
+    _HAS_NUMBA = False
 
-    Uses numpy int64 arrays instead of Python dicts — ~3-5x faster.
-    max_order capped at 1 for speed (bigram + unigram + uniform escape).
-    """
-    tokens = val_tokens.numpy().astype(np.int32)
-    N = len(tokens) - 1
-    ppm_nlls = np.zeros(N + 2, dtype=np.float64)
+
+def _ppm_loop_python(tokens: np.ndarray, N: int, vocab_size: int,
+                     c0: np.ndarray, c1: np.ndarray, t1: np.ndarray,
+                     u1: np.ndarray, ppm_nlls: np.ndarray) -> None:
+    """Pure Python fallback for PPM precompute."""
     inv_vocab = 1.0 / vocab_size
-
-    # Order 0: unigram
-    c0 = np.zeros(vocab_size, dtype=np.int64)
-    t0 = 0
-    u0 = 0
-
-    # Order 1: bigram (prev → target)
-    c1 = np.zeros((vocab_size, vocab_size), dtype=np.int64)
-    t1 = np.zeros(vocab_size, dtype=np.int64)
-    u1 = np.zeros(vocab_size, dtype=np.int64)
-
-    t_start = time.perf_counter()
+    t0_total = 0
+    u0_total = 0
     for t in range(1, N + 1):
         target = int(tokens[t])
         prev = int(tokens[t - 1])
-
-        # PPM-C predict: order 1 → order 0 → uniform
         prob = 0.0
         escape = 1.0
-
         # Order 1 (bigram)
         if t1[prev] > 0:
             denom = int(t1[prev]) + int(u1[prev])
@@ -1294,35 +1282,87 @@ def precompute_ppm_probs(val_tokens: Tensor, max_order: int, vocab_size: int,
             if sc > 0:
                 prob += escape * (sc / denom)
             escape *= int(u1[prev]) / denom
-
         # Order 0 (unigram)
-        if t0 > 0:
-            denom = t0 + u0
+        if t0_total > 0:
+            denom = t0_total + u0_total
             sc = int(c0[target])
             if sc > 0:
                 prob += escape * (sc / denom)
-            escape *= u0 / denom
-
-        # Uniform escape
+            escape *= u0_total / denom
         prob += escape * inv_vocab
         ppm_nlls[t] = -math.log(max(prob, 1e-30))
-
-        # Update counts
+        # Update
         if c1[prev, target] == 0:
             u1[prev] += 1
         c1[prev, target] += 1
         t1[prev] += 1
         if c0[target] == 0:
-            u0 += 1
+            u0_total += 1
         c0[target] += 1
-        t0 += 1
+        t0_total += 1
 
-        if log_fn and t % 10_000_000 == 0:
-            elapsed = time.perf_counter() - t_start
-            rate = t / elapsed
-            eta = (N - t) / rate
-            log_fn(f"ppm_precompute:{t}/{N} rate={rate:.0f}tok/s eta={eta:.0f}s")
 
+if _HAS_NUMBA:
+    @njit(cache=True)
+    def _ppm_loop_numba(tokens, N, vocab_size, c0, c1, t1, u1, ppm_nlls):
+        """Numba JIT-compiled PPM-C loop — ~50-100x faster than Python."""
+        inv_vocab = 1.0 / vocab_size
+        t0_total = np.int64(0)
+        u0_total = np.int64(0)
+        for t in range(1, N + 1):
+            target = tokens[t]
+            prev = tokens[t - 1]
+            prob = 0.0
+            escape = 1.0
+            # Order 1 (bigram)
+            if t1[prev] > 0:
+                denom = t1[prev] + u1[prev]
+                sc = c1[prev, target]
+                if sc > 0:
+                    prob += escape * (sc / denom)
+                escape *= u1[prev] / denom
+            # Order 0 (unigram)
+            if t0_total > 0:
+                denom = t0_total + u0_total
+                sc = c0[target]
+                if sc > 0:
+                    prob += escape * (sc / denom)
+                escape *= u0_total / denom
+            prob += escape * inv_vocab
+            if prob < 1e-30:
+                prob = 1e-30
+            ppm_nlls[t] = -np.log(prob)
+            # Update
+            if c1[prev, target] == 0:
+                u1[prev] += 1
+            c1[prev, target] += 1
+            t1[prev] += 1
+            if c0[target] == 0:
+                u0_total += 1
+            c0[target] += 1
+            t0_total += 1
+
+
+def precompute_ppm_probs(val_tokens: Tensor, max_order: int, vocab_size: int,
+                         log_fn=None) -> np.ndarray:
+    """Precompute PPM-C NLLs. Uses numba if available (~2s), else pure Python (~90s)."""
+    tokens = val_tokens.numpy().astype(np.int64)
+    N = len(tokens) - 1
+    ppm_nlls = np.zeros(N + 2, dtype=np.float64)
+    c0 = np.zeros(vocab_size, dtype=np.int64)
+    c1 = np.zeros((vocab_size, vocab_size), dtype=np.int64)
+    t1 = np.zeros(vocab_size, dtype=np.int64)
+    u1 = np.zeros(vocab_size, dtype=np.int64)
+
+    t_start = time.perf_counter()
+    if _HAS_NUMBA:
+        if log_fn:
+            log_fn("ppm_precompute:using numba (first call includes JIT compile ~10s)")
+        _ppm_loop_numba(tokens, N, vocab_size, c0, c1, t1, u1, ppm_nlls)
+    else:
+        if log_fn:
+            log_fn("ppm_precompute:using python fallback (slow, install numba for 50x speedup)")
+        _ppm_loop_python(tokens, N, vocab_size, c0, c1, t1, u1, ppm_nlls)
     if log_fn:
         log_fn(f"ppm_precompute:done tokens={N} elapsed={time.perf_counter()-t_start:.1f}s")
     return ppm_nlls

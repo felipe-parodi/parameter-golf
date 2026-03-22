@@ -21,7 +21,7 @@ fi
 
 # Deps
 echo ">>> Installing dependencies..."
-pip install -q sentencepiece zstandard huggingface_hub 2>/dev/null || true
+pip install -q sentencepiece zstandard huggingface_hub numba 2>/dev/null || true
 pip install flash-attn --no-build-isolation --no-cache-dir 2>/dev/null || echo "FA2 install failed (non-fatal)"
 
 # FA3: pre-built wheel (seconds)
