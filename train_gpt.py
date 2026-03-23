@@ -881,14 +881,17 @@ class GPT(nn.Module):
                         with torch.no_grad():
                             module.weight.mul_(1.0 / math.sqrt(2 * num_layers))
 
-    def _get_ve(self, layer_idx: int, input_ids: Tensor, ve_cache: dict | None = None) -> Tensor | None:
-        if self.ve_shared is None or layer_idx not in self.ve_layer_indices:
-            return None
-        if ve_cache is not None and "ve" not in ve_cache:
-            ve_cache["ve"] = self.ve_shared(input_ids)
-        ve_base = ve_cache["ve"] if ve_cache is not None else self.ve_shared(input_ids)
-        ve_idx = self.ve_layer_indices.index(layer_idx)
-        return ve_base * self.ve_layer_scales[ve_idx].to(dtype=ve_base.dtype)
+    def _compute_ve_list(self, input_ids: Tensor) -> list[Tensor | None]:
+        """Precompute VE tensors for all layers (compile-friendly, no dict cache)."""
+        num_layers = len(self.blocks)
+        if self.ve_shared is None:
+            return [None] * num_layers
+        ve_base = self.ve_shared(input_ids)
+        result: list[Tensor | None] = [None] * num_layers
+        for idx, layer_idx in enumerate(self.ve_layer_indices):
+            if layer_idx < num_layers:
+                result[layer_idx] = ve_base * self.ve_layer_scales[idx].to(dtype=ve_base.dtype)
+        return result
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
@@ -898,18 +901,16 @@ class GPT(nn.Module):
         x = self.smear(x)
         x0 = x
         skips: list[Tensor] = []
-        ve_cache: dict = {}
+        ve_list = self._compute_ve_list(input_ids)
 
         for i in range(self.num_encoder_layers):
-            ve = self._get_ve(i, input_ids, ve_cache)
-            x = self.blocks[i](x, x0, v_embed=ve)
+            x = self.blocks[i](x, x0, v_embed=ve_list[i])
             skips.append(x)
         for i in range(self.num_decoder_layers):
             bi = self.num_encoder_layers + i
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            ve = self._get_ve(bi, input_ids, ve_cache)
-            x = self.blocks[bi](x, x0, v_embed=ve)
+            x = self.blocks[bi](x, x0, v_embed=ve_list[bi])
 
         x = self.final_norm(x)
         x_flat = x.reshape(-1, x.size(-1))
@@ -951,17 +952,15 @@ class GPT(nn.Module):
         x = self.smear(x)
         x0 = x
         skips: list[Tensor] = []
-        ve_cache: dict = {}
+        ve_list = self._compute_ve_list(input_ids)
         for i in range(self.num_encoder_layers):
-            ve = self._get_ve(i, input_ids, ve_cache)
-            x = self.blocks[i](x, x0, v_embed=ve)
+            x = self.blocks[i](x, x0, v_embed=ve_list[i])
             skips.append(x)
         for i in range(self.num_decoder_layers):
             bi = self.num_encoder_layers + i
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            ve = self._get_ve(bi, input_ids, ve_cache)
-            x = self.blocks[bi](x, x0, v_embed=ve)
+            x = self.blocks[bi](x, x0, v_embed=ve_list[bi])
         x = self.final_norm(x)
         if self.tie_embeddings:
             logits_proj = F.linear(x, self.tok_emb.weight)
