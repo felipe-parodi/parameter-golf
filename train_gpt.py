@@ -524,6 +524,7 @@ class CausalSelfAttention(nn.Module):
         return (y_g - proj).reshape(B, T, H, D)
     def forward(self, x: Tensor, v_embed: Tensor | None = None,
                 v0: Tensor | None = None) -> tuple[Tensor, Tensor | None]:
+        # v0 is always a Tensor (zeros for layer 0) — no conditional branching for torch.compile
         bsz, seqlen, dim = x.shape
         q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim)
         k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
@@ -534,10 +535,7 @@ class CausalSelfAttention(nn.Module):
         raw_v = v if self.value_residual else None
         if self.value_residual:
             lam = self.vr_lambda.to(dtype=v.dtype)
-            if v0 is not None:
-                v = lam[0] * v0 + lam[1] * v
-            else:
-                v = lam[1] * v  # layer 0: no v0, but lambda still participates in graph
+            v = lam[0] * v0 + lam[1] * v
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
@@ -796,7 +794,9 @@ class GPT(nn.Module):
         x0 = x
         skips: list[Tensor] = []
         ve_cache: dict = {}
-        v0: Tensor | None = None
+        num_kv = self.blocks[0].attn.num_kv_heads
+        hdim = self.blocks[0].attn.head_dim
+        v0 = torch.zeros(x.shape[0], x.shape[1], num_kv, hdim, device=x.device, dtype=x.dtype)
         for i in range(self.num_encoder_layers):
             ve = self._get_ve(i, input_ids, ve_cache)
             x, raw_v = self.blocks[i](x, x0, v_embed=ve, v0=v0)
@@ -849,7 +849,9 @@ class GPT(nn.Module):
         x0 = x
         skips: list[Tensor] = []
         ve_cache: dict = {}
-        v0: Tensor | None = None
+        num_kv = self.blocks[0].attn.num_kv_heads
+        hdim = self.blocks[0].attn.head_dim
+        v0 = torch.zeros(x.shape[0], x.shape[1], num_kv, hdim, device=x.device, dtype=x.dtype)
         for i in range(self.num_encoder_layers):
             ve = self._get_ve(i, input_ids, ve_cache)
             x, raw_v = self.blocks[i](x, x0, v_embed=ve, v0=v0)
