@@ -200,22 +200,33 @@ Issue #402 challenges the validity of epoch-based TTT (including our PR #398). A
 
 **Our PR #398 is explicitly listed as potentially invalid in Issue #402.**
 
-## Updated Leaderboard (as of PR #444, 2026-03-22 evening)
+## Updated Leaderboard (as of Issue #140 update, Mar 22 7:05 PM PT)
 
 ### Non-TTT (safe for record track)
 | PR | BPB | Author | Key Innovation |
 |---|---|---|---|
-| #414 | **1.1233** (3-seed) | AbhisekBasu1 | **GPTQ-lite** + EMA + warmdown3500 + QAT@0.15 |
-| #401 | 1.1243 (best) | — | EMA + Tight SWA stacking + Late QAT@0.15 + VE128 |
+| #414 | **1.1233** (3-seed) | signalrush | **GPTQ-lite** + EMA + Tight SWA + VE128 + XSA4 + warmdown3500 |
+| #445 | 1.1236 (2-seed) | newjordan | #414 base + "TTT Burst" (training data replay, claims non-TTT) |
+| #401 | 1.1243 (1-seed) | newjordan | EMA + Tight SWA stacking + Late QAT@0.15 + VE128 |
 | #374 | 1.1246 (1-seed) | unnir | Tight SWA + VE128 + Partial RoPE + LN Scale |
-| #315 | 1.1250 (3-seed) | jfprincz | Partial RoPE + LN Scale + EMA + Late QAT + XSA4 |
+| #315 | 1.1250 (3-seed) | jfprincz | Partial RoPE + LN Scale + EMA + XSA4 (Late QAT was dead code!) |
 
 ### TTT-based (validity disputed, Issue #402)
 | PR | BPB | Author | Key Innovation |
 |---|---|---|---|
-| #442 | **1.1027** (?) | sjp611 | AdamW TTT 10ep — if real, massive jump |
-| #398 | 1.1221 (3-seed) | **us** | EMA + TTT(20ep,lr=0.008,freeze=0) |
-| #417 | 1.1222 (3-seed) | — | Two-Phase TTT: norm recalibration + selective freeze |
+| #490 | **1.0891** (1-seed!) | amaljithkuttamath | Value Residual + Gated Attention + AdamW TTT |
+| #481 | 1.0970 (3-seed) | mrdavtan | Cosine TTT + per-layer LR (3x MLP output proj) |
+| #442 | 1.1027 (3-seed) | sjp611 | AdamW TTT 10ep (3-line diff from our #398) |
+| #486 | 1.1132 (3-seed) | ndokutovich | TrigramHash + Value Residual + GradQuant + TTT |
+| #473 | 1.1219 (3-seed) | abaybektursun | Legal score-first TTT + Parallel Muon on #414 |
+| #398 | 1.1221 (3-seed) | **us** | EMA + TTT(20ep,freeze=0) — converted to non-record |
+
+### Key intel from Issue #140 (live commentary)
+- **Value Residual on #414 base (no TTT) is listed as Tier 2 highest-value untried combo.** Est. -0.005 to -0.010 BPB → ~1.113-1.118.
+- **This is exactly what we're doing now** (+ TrigramHash on top).
+- Late QAT in PR #315 was **dead code** (torch.compile constant-folds _qat_enabled). Many submissions claiming Late QAT benefit may not actually be running it.
+- PR #490 (1.0891) shows Value Residual + Gated Attention is massive with TTT.
+- PR #445 "TTT Burst" replays TRAINING data (not val) → may be legal non-TTT technique.
 
 ## New Techniques Since Session 1 (PRs #390-444)
 
