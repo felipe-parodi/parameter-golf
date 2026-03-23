@@ -532,9 +532,12 @@ class CausalSelfAttention(nn.Module):
             v = v + v_embed
         v = v.reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
         raw_v = v if self.value_residual else None
-        if self.value_residual and v0 is not None:
+        if self.value_residual:
             lam = self.vr_lambda.to(dtype=v.dtype)
-            v = lam[0] * v0 + lam[1] * v
+            if v0 is not None:
+                v = lam[0] * v0 + lam[1] * v
+            else:
+                v = lam[1] * v  # layer 0: no v0, but lambda still participates in graph
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
@@ -726,7 +729,7 @@ class GPT(nn.Module):
                     layer_idx=i,
                     ln_scale=ln_scale,
                     dtg=dtg,
-                    value_residual=value_residual and i > 0,  # layer 0 produces v0, doesn't consume it
+                    value_residual=value_residual,
                 )
                 for i in range(num_layers)
             ]
