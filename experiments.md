@@ -153,8 +153,39 @@ This matches #315's 1.1250. We are NOT ahead without TTT.
 - [ ] **GPTQ-lite clip search** — zero-cost quant refinement
 - [ ] Request additional compute from OpenAI ($1M pool)
 
+## Session 2 (2026-03-22/23) — Non-TTT Attempts
+
+### TTT Ruling
+- PR #398 converted to non-record (Issue #402, organizer says TTT "not in spirit")
+- PR #388 (25-epoch TTT) was CLOSED
+- Non-TTT SOTA: PR #414 at 1.1233
+
+### Attempts
+- **PR #414 replication (our VE128 reimplementation)**: 120ms/step — our VE128 dict cache broke torch.compile
+- **PR #414 actual code**: 100ms on one pod (slow pod), 85ms on another (fast pod)
+- **PR #414 + Value Residual + TrigramHash**: compile + DDP issues (tuple returns, find_unused_parameters). Multiple crashes fixed.
+- **Run 15 base + Value Residual only**: 105ms cumulative avg, but instantaneous rate at step 400-500 was 80ms. Full run in progress but step avg settling at ~105ms over 2000 steps.
+
+### Key Learnings Session 2
+- **Pod-to-pod speed variance is real**: 81ms on one pod, 100ms on another, same GPU type (H100 SXM HBM3)
+- **torch.compile warmup distorts smoke tests**: first 400 steps are slow (compile + recompile), steady state is faster
+- **Value Residual tuple returns break torch.compile fullgraph**: needed find_unused_parameters=True (10-15ms DDP overhead) or restructured code
+- **VE128 dict cache didn't break PR #414's compile**: the issue was something else in our code (possibly bf16 cast, possibly import structure)
+- **TrigramHash adds ~15-20ms overhead**: not worth it at the margin
+- **Always test on proven code first**: we wasted runs reimplementing PR #414 instead of starting from their exact code
+
+### Current Run (in progress)
+Run 15 base (no VE128, no XSA, EMA only) + Value Residual, TTT disabled
+- Step 2000: step_avg 105ms, val_bpb 1.2935
+- If avg settles to ~95ms: ~6300 steps → ~1.125-1.130
+- If avg settles to ~85ms (like Run 15): ~7000 steps → ~1.118-1.122
+
+### Remaining Budget
+~$50 remaining + pending compute grant application ($1K requested)
+
 ## Timeline
-- Session 1: 2026-03-21/22 — 15 runs, submitted PR #398 (1.1221, TTT-based)
-- **Session 2 priority: non-TTT submission beating 1.1250**
-- Competition ends: 2026-04-30 (~5.5 weeks remaining)
-- Budget: ~$67 remaining + potential OpenAI compute grant
+- Session 1: 2026-03-21/22 — 15 runs, submitted PR #398 (1.1221, TTT-based, now non-record)
+- Session 2: 2026-03-22/23 — non-TTT attempts, pod speed issues, VR integration
+- **Session 3 priority: get VR working at 85ms, 3-seed non-TTT submission**
+- Competition ends: 2026-04-30 (~5 weeks remaining)
+- Budget: ~$50 remaining + pending compute grant
