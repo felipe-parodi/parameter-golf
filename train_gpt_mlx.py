@@ -76,6 +76,8 @@ class Hyperparameters:
     logit_softcap: float = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
     rope_base: float = float(os.environ.get("ROPE_BASE", 10000.0))
     qk_gain_init: float = float(os.environ.get("QK_GAIN_INIT", 1.5))
+    num_physical_layers: int = int(os.environ.get("NUM_PHYSICAL_LAYERS", 0))  # 0=disabled (use num_layers unique blocks)
+    num_eval_layers: int = int(os.environ.get("NUM_EVAL_LAYERS", 0))  # 0=use num_layers at eval too
 
     # Optimizer. We keep the same per-group defaults as train_gpt.py.
     beta1: float = float(os.environ.get("BETA1", 0.9))
@@ -120,7 +122,8 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,q_gains,"
+        "skip_weight,skip_weights,layer_attn_scales,layer_mlp_scales,layer_resid_mixes,layer_q_gains",
     ).split(",")
     if pattern
 )
@@ -320,7 +323,7 @@ class CausalSelfAttention(nn.Module):
         self.rope = nn.RoPE(self.head_dim, traditional=False, base=rope_base)
         self.scale = self.head_dim ** -0.5
 
-    def __call__(self, x: mx.array) -> mx.array:
+    def __call__(self, x: mx.array, q_gain: mx.array | None = None) -> mx.array:
         bsz, seqlen, dim = x.shape
         q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
         k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
@@ -328,7 +331,8 @@ class CausalSelfAttention(nn.Module):
 
         q = self.rope(rms_norm(q).astype(COMPUTE_DTYPE))
         k = self.rope(rms_norm(k).astype(COMPUTE_DTYPE))
-        q = q * self.q_gain.astype(q.dtype)[None, :, None, None]
+        _qg = q_gain if q_gain is not None else self.q_gain
+        q = q * _qg.astype(q.dtype)[None, :, None, None]
         y = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale, mask="causal")
         y = y.transpose(0, 2, 1, 3).reshape(bsz, seqlen, dim)
         return self.proj(y)
@@ -366,38 +370,75 @@ class Block(nn.Module):
         self.mlp_scale = mx.ones((dim,), dtype=mx.float32)
         self.resid_mix = mx.array(np.stack((np.ones((dim,), dtype=np.float32), np.zeros((dim,), dtype=np.float32))))
 
-    def __call__(self, x: mx.array, x0: mx.array) -> mx.array:
-        mix = self.resid_mix.astype(x.dtype)
-        x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out = self.attn(self.attn_norm(x))
-        x = x + self.attn_scale.astype(x.dtype)[None, None, :] * attn_out
-        x = x + self.mlp_scale.astype(x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+    def __call__(
+        self,
+        x: mx.array,
+        x0: mx.array,
+        attn_scale: mx.array | None = None,
+        mlp_scale: mx.array | None = None,
+        resid_mix: mx.array | None = None,
+        q_gain: mx.array | None = None,
+    ) -> mx.array:
+        _mix = (resid_mix if resid_mix is not None else self.resid_mix).astype(x.dtype)
+        x = _mix[0][None, None, :] * x + _mix[1][None, None, :] * x0
+        attn_out = self.attn(self.attn_norm(x), q_gain=q_gain)
+        _as = (attn_scale if attn_scale is not None else self.attn_scale).astype(x.dtype)
+        x = x + _as[None, None, :] * attn_out
+        _ms = (mlp_scale if mlp_scale is not None else self.mlp_scale).astype(x.dtype)
+        x = x + _ms[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
 
 
 class GPT(nn.Module):
     # - token embedding + RMSNorm
-    # - encoder half accumulates skip tensors
-    # - decoder half consumes reversed skips with learned skip_weights
+    # - Standard mode: encoder/decoder with U-Net skip connections
+    # - Shared mode: fewer physical blocks cycled with per-layer untied scalars
     # - tied embeddings for the LM head (the baseline default setup)
     def __init__(self, vocab_size: int, num_layers: int, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
                  logit_chunk_tokens: int, logit_softcap: float, rope_base: float, tied_embed_init_std: float,
-                 qk_gain_init: float):
+                 qk_gain_init: float, num_physical_layers: int = 0, num_eval_layers: int = 0):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
         self.logit_chunk_tokens = logit_chunk_tokens
         self.logit_softcap = logit_softcap
+        self.num_layers = num_layers
 
         self.tok_emb = nn.Embedding(vocab_size, dim)
-        self.num_encoder_layers = num_layers // 2
-        self.num_decoder_layers = num_layers - self.num_encoder_layers
-        self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
-        self.skip_weights = mx.ones((self.num_skip_weights, dim), dtype=mx.float32)
-        self.blocks = [
-            Block(dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
-            for i in range(num_layers)
-        ]
+
+        # Shared-weight recurrence mode: num_physical_layers < num_layers
+        self.shared_mode = num_physical_layers > 0
+        self.num_physical_layers = num_physical_layers if self.shared_mode else num_layers
+        self.num_eval_layers = num_eval_layers if num_eval_layers > 0 else num_layers
+
+        if self.shared_mode:
+            self.skip_weights = None
+            self.num_encoder_layers = 0
+            self.num_decoder_layers = 0
+            self.blocks = [
+                Block(dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
+                for _ in range(self.num_physical_layers)
+            ]
+            # Per-logical-layer untied scalars (cheap, stored as passthrough in export)
+            self.layer_attn_scales = mx.ones((num_layers, dim), dtype=mx.float32)
+            self.layer_mlp_scales = mx.ones((num_layers, dim), dtype=mx.float32)
+            self.layer_resid_mixes = mx.array(np.stack(
+                [np.stack((np.ones(dim, dtype=np.float32), np.zeros(dim, dtype=np.float32))) for _ in range(num_layers)]
+            ))
+            self.layer_q_gains = mx.ones((num_layers, num_heads), dtype=mx.float32) * qk_gain_init
+        else:
+            self.skip_weights = mx.ones((min(num_layers // 2, num_layers - num_layers // 2), dim), dtype=mx.float32)
+            self.num_encoder_layers = num_layers // 2
+            self.num_decoder_layers = num_layers - self.num_encoder_layers
+            self.layer_attn_scales = None
+            self.layer_mlp_scales = None
+            self.layer_resid_mixes = None
+            self.layer_q_gains = None
+            self.blocks = [
+                Block(dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
+                for _ in range(num_layers)
+            ]
+
         self.final_norm = RMSNormNoWeight()
 
         for b in self.blocks:
@@ -411,27 +452,37 @@ class GPT(nn.Module):
         c = self.logit_softcap
         return c * mx.tanh(logits / c)
 
-    def __call__(self, input_ids: mx.array) -> mx.array:
+    def __call__(self, input_ids: mx.array, num_layers: int | None = None) -> mx.array:
         x = rms_norm(self.tok_emb(input_ids).astype(COMPUTE_DTYPE))
         x0 = x
-        skips: list[mx.array] = []
 
-        for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
-            skips.append(x)
-        for i in range(self.num_decoder_layers):
-            # Odd layer counts have one more decoder block than encoder block. The baseline only
-            # applies a skip connection when one exists, then runs the remaining decoder block(s)
-            # without an added skip.
-            if skips:
-                x = x + self.skip_weights[i].astype(x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+        if self.shared_mode:
+            n = num_layers if num_layers is not None else self.num_layers
+            for i in range(n):
+                phys_idx = i % self.num_physical_layers
+                scalar_idx = i % self.num_layers
+                x = self.blocks[phys_idx](
+                    x, x0,
+                    attn_scale=self.layer_attn_scales[scalar_idx],
+                    mlp_scale=self.layer_mlp_scales[scalar_idx],
+                    resid_mix=self.layer_resid_mixes[scalar_idx],
+                    q_gain=self.layer_q_gains[scalar_idx],
+                )
+        else:
+            skips: list[mx.array] = []
+            for i in range(self.num_encoder_layers):
+                x = self.blocks[i](x, x0)
+                skips.append(x)
+            for i in range(self.num_decoder_layers):
+                if skips:
+                    x = x + self.skip_weights[i].astype(x.dtype)[None, None, :] * skips.pop()
+                x = self.blocks[self.num_encoder_layers + i](x, x0)
         return self.final_norm(x)
 
-    def loss(self, input_ids: mx.array, target_ids: mx.array) -> mx.array:
+    def loss(self, input_ids: mx.array, target_ids: mx.array, num_layers: int | None = None) -> mx.array:
         # Cross-entropy over flattened tokens. We keep optional logit chunking because it is a useful
         # memory knob on Macs, but the common path is chunk_tokens=0 (single matmul + CE).
-        x = self(input_ids).reshape(-1, self.tok_emb.weight.shape[1])
+        x = self(input_ids, num_layers=num_layers).reshape(-1, self.tok_emb.weight.shape[1])
         y = target_ids.reshape(-1)
         if self.logit_chunk_tokens <= 0 or x.shape[0] <= self.logit_chunk_tokens:
             logits_proj = x @ self.tok_emb.weight.astype(x.dtype).T
@@ -481,7 +532,7 @@ class Muon:
 class SplitOptimizers:
     # - embeddings: Adam with the tied-embedding LR
     # - block matrices (2D): Muon
-    # - block scalars + skip weights: Adam
+    # - block scalars + skip weights (or shared-mode per-layer scalars): Adam
     # This preserves the high-level optimization behavior even though MLX internals differ.
     def __init__(self, model: GPT, args: Hyperparameters):
         self.args = args
@@ -492,11 +543,18 @@ class SplitOptimizers:
             for k, p in params.items()
             if k.startswith("blocks.") and p.ndim == 2 and not any(pattern in k for pattern in CONTROL_TENSOR_NAME_PATTERNS)
         ]
-        self.scalar_keys = [
-            k
-            for k, p in params.items()
-            if k == "skip_weights" or (k.startswith("blocks.") and (p.ndim < 2 or any(pattern in k for pattern in CONTROL_TENSOR_NAME_PATTERNS)))
-        ]
+        if model.shared_mode:
+            # In shared mode, per-layer scalars live on GPT, not on blocks.
+            self.scalar_keys = [
+                k for k in params
+                if k in ("layer_attn_scales", "layer_mlp_scales", "layer_resid_mixes", "layer_q_gains")
+            ]
+        else:
+            self.scalar_keys = [
+                k
+                for k, p in params.items()
+                if k == "skip_weights" or (k.startswith("blocks.") and (p.ndim < 2 or any(pattern in k for pattern in CONTROL_TENSOR_NAME_PATTERNS)))
+            ]
 
         self.muon = Muon(self.matrix_keys, params, args)
         self.adam_embed = optim.Adam(
@@ -891,6 +949,8 @@ def main() -> None:
         rope_base=args.rope_base,
         tied_embed_init_std=args.tied_embed_init_std,
         qk_gain_init=args.qk_gain_init,
+        num_physical_layers=args.num_physical_layers,
+        num_eval_layers=args.num_eval_layers,
     )
     opt = SplitOptimizers(model, args)
 
@@ -902,6 +962,11 @@ def main() -> None:
     # Compiling the model-bound functions and capturing the full model state fixes that while still
     # returning gradients only for trainable parameters via nn.value_and_grad(...).
     compiled_loss = mx.compile(lambda x, y: model.loss(x, y), inputs=model.state, outputs=model.state)
+    _eval_num_layers = model.num_eval_layers if model.shared_mode else None
+    compiled_eval_loss = (
+        mx.compile(lambda x, y: model.loss(x, y, num_layers=_eval_num_layers), inputs=model.state, outputs=model.state)
+        if _eval_num_layers is not None else compiled_loss
+    )
     compiled_loss_and_grad = mx.compile(
         nn.value_and_grad(model, lambda x, y: model.loss(x, y)),
         inputs=model.state,
@@ -930,6 +995,11 @@ def main() -> None:
         f"dim:{args.model_dim} heads:{args.num_heads} kv_heads:{args.num_kv_heads} "
         f"seq_len:{args.train_seq_len} tie_embeddings:{args.tie_embeddings}"
     )
+    if model.shared_mode:
+        log(
+            f"shared_mode:True num_physical_layers:{model.num_physical_layers} "
+            f"num_train_layers:{args.num_layers} num_eval_layers:{model.num_eval_layers}"
+        )
     log(
         f"iterations:{args.iterations} train_batch_tokens:{args.train_batch_tokens} grad_accum_steps:{args.grad_accum_steps} "
         f"microbatch_tokens:{args.microbatch_tokens} microbatch_batch_size:{args.microbatch_tokens // args.train_seq_len} "
@@ -945,10 +1015,11 @@ def main() -> None:
     )
     log(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
     log(f"compute_dtype:{COMPUTE_DTYPE} compile:True")
+    skip_dtype = model.skip_weights.dtype if model.skip_weights is not None else "n/a(shared)"
     log(
         f"dtypes tok_emb:{model.tok_emb.weight.dtype} "
         f"linear_weight:{model.blocks[0].attn.c_q.weight.dtype} "
-        f"skip_weights:{model.skip_weights.dtype}"
+        f"skip_weights:{skip_dtype}"
     )
 
     # ==============================================================================
@@ -1080,7 +1151,7 @@ def main() -> None:
     q_t0 = time.perf_counter()
     q_val_loss, q_val_bpb = eval_val(
         args,
-        compiled_loss,
+        compiled_eval_loss,
         val_tokens,
         base_bytes_lut,
         has_leading_space_lut,
